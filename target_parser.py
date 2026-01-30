@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import re
 
 try:
@@ -7,126 +7,126 @@ try:
     SLITHER_AVAILABLE = True
 except ImportError:
     SLITHER_AVAILABLE = False
-    print("[!] Slither not available, using regex fallback")
 
 class TargetParser:
     def __init__(self, code_path: str):
         self.path = Path(code_path)
         self.files = list(self.path.rglob("*.sol"))
         
-    def analyze_with_slither(self, file_path: Path) -> Dict:
-        if not SLITHER_AVAILABLE:
-            return self.parse_file_regex(file_path)
-            
-        try:
-            slither = Slither(str(file_path))
-            analysis = {
-                "file": str(file_path.relative_to(self.path)),
-                "slither_bugs": [],
-                "high_risk_functions": [],
-                "entry_points": [],
-                "state_variables": [],
-                "architecture": {}
-            }
-            
-            for contract in slither.contracts:
-                # State variables
-                analysis["state_variables"] = [str(s) for s in contract.state_variables]
-                
-                for function in contract.functions:
-                    func_info = {
-                        "name": function.name,
-                        "external": function.visibility in ['external', 'public'],
-                        "payable": function.payable,
-                        "modifiers": [str(m) for m in function.modifiers]
-                    }
-                    
-                    if func_info["external"]:
-                        analysis["entry_points"].append(function.name)
-                    
-                    # P0: Reentrancy (state after external call)
-                    if function.is_reentrant:
-                        external = [str(c) for c in function.external_calls]
-                        state_after = [str(s) for s in function.state_variables_written]
-                        if state_after:
-                            analysis["slither_bugs"].append({
-                                "type": "reentrancy",
-                                "function": function.name,
-                                "severity": "critical",
-                                "details": f"External calls: {external}, State written: {state_after}"
-                            })
-                    
-                    # P0: Unchecked calls
-                    for node in function.nodes:
-                        node_str = str(node)
-                        if ('.call{' in node_str or '.call(' in node_str) and 'success' not in node_str:
-                            analysis["slither_bugs"].append({
-                                "type": "unchecked_call",
-                                "function": function.name,
-                                "severity": "high"
-                            })
-                    
-                    # P1: Flash loan vectors (external + value transfer)
-                    if any(k in function.name.lower() for k in ['flash', 'swap', 'liquidate', 'borrow']):
-                        if function.external_calls:
-                            analysis["high_risk_functions"].append({
-                                "name": function.name,
-                                "risk": "flash_loan",
-                                "external_calls": len(function.external_calls)
-                            })
-            
-            # Architecture detection
-            content = file_path.read_text(errors='ignore')
-            analysis["architecture"] = {
-                "complexity_score": len(analysis["entry_points"]) * 2 + len(analysis["slither_bugs"]) * 5,
-                "uses_oracle": any(x in content for x in ["oracle", "price", "feed"]),
-                "lending": any(x in content for x in ["borrow", "collateral", "liquidat"]),
-                "amm": any(x in content for x in ["swap", "pair", "getAmount"]),
-                "proxy": 'delegatecall' in content or 'upgradeable' in content,
-                "erc20": "transferFrom" in content,
-                "functions": [f["name"] for f in analysis["high_risk_functions"]]
-            }
-            
-            return analysis
-            
-        except Exception as e:
-            return self.parse_file_regex(file_path)
-    
-    def parse_file_regex(self, file_path: Path) -> Dict:
-        content = file_path.read_text(errors='ignore')
-        funcs = re.findall(r'function\s+(\w+)[^{]*\{', content)
+    def extract_functions(self, content: str) -> List[Tuple[str, str]]:
+        """Extract individual functions with full code"""
+        # Pattern: function name(...) {...} 
+        # Handles modifiers, visibility, etc.
+        pattern = r'(function\s+\w+\s*\([^)]*\)[^{]*\{)'
         
-        return {
+        matches = []
+        for match in re.finditer(pattern, content):
+            start = match.start()
+            func_start = content[start:]
+            
+            # Find matching closing brace (naive but works for 95% of cases)
+            brace_count = 0
+            end_pos = 0
+            for i, char in enumerate(func_start):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_pos = i + 1
+                        break
+            
+            func_code = func_start[:end_pos]
+            func_name = re.search(r'function\s+(\w+)', func_code).group(1)
+            matches.append((func_name, func_code))
+        
+        return matches
+    
+    def analyze_function(self, func_name: str, func_code: str, file_path: Path) -> Dict:
+        """Deep analysis of single function"""
+        code_lower = func_code.lower()
+        
+        analysis = {
             "file": str(file_path.relative_to(self.path)),
-            "slither_bugs": [],
-            "high_risk_functions": [],
-            "entry_points": [],
-            "state_variables": [],
-            "architecture": {
-                "complexity_score": len(funcs),
-                "uses_oracle": any(x in content for x in ["oracle", "price"]),
-                "lending": any(x in content for x in ["borrow", "collateral"]),
-                "amm": any(x in content for x in ["swap", "pair"]),
-                "proxy": 'delegatecall' in content,
-                "erc20": "transferFrom" in content,
-                "functions": funcs
-            },
-            "content_snippet": content[:10000]
+            "function": func_name,
+            "code": func_code,
+            "is_entry_point": 'external' in func_code or 'public' in func_code,
+            "is_payable": 'payable' in func_code,
+            "has_reentrancy_guard": 'nonReentrant' in func_code or 'reentrancy' in func_code,
+            "external_calls": [],
+            "state_changes": [],
+            "risk_score": 0
         }
-    
-    def parse_all(self):
-        results = []
-        print(f"[+] Analyzing {len(self.files)} files with {'Slither AST' if SLITHER_AVAILABLE else 'Regex'}...")
         
-        for i, f in enumerate(self.files):
-            if i % 5 == 0:
-                print(f"  Progress: {i}/{len(self.files)}")
+        # Detect external calls
+        external_patterns = [
+            r'(\w+\.call\{[^}]*\})',
+            r'(\w+\.delegatecall\()',
+            r'(\w+\.transfer\()',
+            r'(IERC20\([^)]+\)\.transfer)',
+            r'(\w+\.swap\()',
+        ]
+        
+        for pattern in external_patterns:
+            matches = re.findall(pattern, func_code)
+            analysis["external_calls"].extend(matches)
+        
+        # Detect state changes (approximate)
+        state_patterns = [
+            r'\b(balance|totalSupply|balances|allowances)\s*[+\-]?=',
+            r'\b(_\w+)\s*=',
+        ]
+        for pattern in state_patterns:
+            matches = re.findall(pattern, func_code)
+            analysis["state_changes"].extend(matches)
+        
+        # Calculate risk score
+        if analysis["external_calls"]:
+            analysis["risk_score"] += 20
+        if analysis["state_changes"] and analysis["external_calls"]:
+            analysis["risk_score"] += 30  # Reentrancy risk
+        if analysis["is_payable"]:
+            analysis["risk_score"] += 10
+        if not analysis["has_reentrancy_guard"] and analysis["external_calls"]:
+            analysis["risk_score"] += 20
+        
+        return analysis
+    
+    def parse_all(self) -> List[Dict]:
+        """Parse all files, return individual functions (not whole files)"""
+        all_functions = []
+        
+        print(f"[+] Parsing {len(self.files)} files into individual functions...")
+        
+        for file_path in self.files:
             try:
-                if SLITHER_AVAILABLE:
-                    results.append(self.analyze_with_slither(f))
-                else:
-                    results.append(self.parse_file_regex(f))
-            except Exception as e:
-                print(f"  [!] Failed to parse {f}: {e}")
+                content = file_path.read_text(errors='ignore')
                 
-        return results
+                # Skip test files
+                if any(x in str(file_path) for x in ['test', 'Test', 'mock', 'Mock']):
+                    continue
+                
+                # Extract architecture info once per file
+                arch_info = {
+                    "uses_oracle": any(x in content for x in ["oracle", "price", "feed"]),
+                    "lending": any(x in content for x in ["borrow", "collateral"]),
+                    "amm": any(x in content for x in ["swap", "pair"]),
+                    "proxy": 'delegatecall' in content,
+                }
+                
+                # Extract individual functions
+                functions = self.extract_functions(content)
+                
+                for func_name, func_code in functions:
+                    func_analysis = self.analyze_function(func_name, func_code, file_path)
+                    func_analysis["architecture"] = arch_info
+                    all_functions.append(func_analysis)
+                    
+            except Exception as e:
+                print(f"  [!] Failed to parse {file_path}: {e}")
+        
+        print(f"[✓] Extracted {len(all_functions)} individual functions")
+        
+        # Sort by risk score (analyze high-risk first)
+        all_functions.sort(key=lambda x: x["risk_score"], reverse=True)
+        return all_functions

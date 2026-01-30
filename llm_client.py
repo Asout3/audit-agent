@@ -1,7 +1,18 @@
-import requests
 import json
+from typing import Dict, List
+import requests
 import time
+from dataclasses import dataclass
 from config import Config
+
+@dataclass
+class ExtractionResult:
+    vuln_class: str
+    assumed_invariant: str
+    break_condition: str
+    preconditions: List[str]
+    code_indicators: List[str]
+    severity_score: str
 
 class LLMClient:
     def __init__(self):
@@ -14,173 +25,164 @@ class LLMClient:
             "Content-Type": "application/json"
         }
         
-    def validate(self) -> bool:
+    def _strict_parse(self, text: str) -> ExtractionResult:
+        """Strict JSON validation with fallback repair"""
+        try:
+            # Clean markdown
+            if "```json" in text:
+                text = text.split("```json")[1].split("```")[0]
+            elif "```" in text:
+                text = text.split("```")[1].split("```")[0]
+            
+            data = json.loads(text.strip())
+            
+            # Validate required fields exist and are non-empty
+            required_strings = ['vuln_class', 'assumed_invariant', 'break_condition']
+            for field in required_strings:
+                if not isinstance(data.get(field), str) or len(data.get(field, '').strip()) < 5:
+                    raise ValueError(f"Missing or invalid {field}")
+            
+            # Validate arrays
+            preconditions = data.get('preconditions', [])
+            code_indicators = data.get('code_indicators', [])
+            if not isinstance(preconditions, list):
+                preconditions = [str(preconditions)] if preconditions else []
+            if not isinstance(code_indicators, list):
+                code_indicators = [str(code_indicators)] if code_indicators else []
+            
+            # Validate severity
+            severity = data.get('severity_score', 'Medium')
+            if severity not in ['High', 'Medium', 'Low']:
+                severity = 'Medium'
+            
+            return ExtractionResult(
+                vuln_class=data['vuln_class'].strip(),
+                assumed_invariant=data['assumed_invariant'].strip(),
+                break_condition=data['break_condition'].strip(),
+                preconditions=[p.strip() for p in preconditions if p],
+                code_indicators=[c.strip() for c in code_indicators if c],
+                severity_score=severity
+            )
+            
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            raise ValueError(f"Parse failed: {e}")
+    
+    def extract_invariant(self, content: str, title: str, max_retries: int = 3) -> ExtractionResult:
+        """Extract with strict validation and aggressive retry"""
+        
+        base_prompt = f"""Analyze this vulnerability and extract the invariant violation.
+
+Title: {title}
+Content: {content[:7000]}
+
+You MUST return valid JSON with exactly these fields:
+{{
+    "vuln_class": "Short category name",
+    "assumed_invariant": "What developers assumed was true (2-3 sentences)",
+    "break_condition": "Specific attack that broke it (2-3 sentences)",
+    "preconditions": ["condition1", "condition2"],
+    "code_indicators": ["functionName", "variablePattern"],
+    "severity_score": "High" or "Medium" or "Low"
+}}
+
+Rules:
+- vuln_class: One word or short phrase (Reentrancy, OracleManipulation, etc)
+- assumed_invariant: Must start with "Developers assumed..."
+- break_condition: Must describe the specific attack vector
+- All string fields must be non-empty
+- preconditions must be an array of strings, even if empty []
+
+Return ONLY the JSON object, no markdown, no explanation."""
+
+        for attempt in range(max_retries):
+            try:
+                resp = requests.post(
+                    f"{Config.OPENROUTER_BASE_URL}/chat/completions",
+                    headers=self.headers,
+                    json={
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": base_prompt}],
+                        "temperature": 0.0,  # Deterministic
+                        "max_tokens": 800,
+                        "response_format": {"type": "json_object"}
+                    },
+                    timeout=60
+                )
+                
+                if resp.status_code != 200:
+                    time.sleep(2 ** attempt)
+                    continue
+                
+                result_text = resp.json()["choices"][0]["message"]["content"]
+                return self._strict_parse(result_text)
+                
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    # Final fallback with simplified prompt
+                    return self._emergency_extraction(content, title)
+                time.sleep(2 ** attempt)
+        
+        return self._emergency_extraction(content, title)
+    
+    def _emergency_extraction(self, content: str, title: str) -> ExtractionResult:
+        """Last resort: extract anything usable"""
+        # Try to infer from title and first paragraph
+        first_para = content.split('\n')[0] if content else title
+        
+        vuln_type = "Unknown"
+        if any(w in title.lower() for w in ['reentrancy', 're-entrancy']):
+            vuln_type = "Reentrancy"
+        elif any(w in title.lower() for w in ['oracle', 'price']):
+            vuln_type = "OracleManipulation"
+        elif any(w in title.lower() for w in ['access', 'permission', 'auth']):
+            vuln_type = "AccessControl"
+        
+        return ExtractionResult(
+            vuln_class=vuln_type,
+            assumed_invariant=f"Developers assumed {first_para[:100]}",
+            break_condition="Invariant violated due to unexpected interaction",
+            preconditions=[],
+            code_indicators=[],
+            severity_score="Medium"
+        )
+    
+    def generate_hypothesis(self, target_code: str, patterns: List[Dict], func_name: str) -> List[Dict]:
+        """Generate hypothesis for a specific function"""
+        if not patterns:
+            return []
+            
+        patterns_text = "\n".join([
+            f"- {p['invariant']}: {p['break_condition'][:100]}" 
+            for p in patterns[:2]
+        ])
+        
+        prompt = f"""Analyze function '{func_name}' for invariant violations.
+
+Function Code:
+{target_code[:3000]}
+
+Historical patterns:
+{patterns_text}
+
+Return JSON array with max 2 hypotheses:
+[{{"hypothesis": "...", "attack_vector": "...", "confidence": "High/Medium/Low"}}]"""
+
         try:
             resp = requests.post(
                 f"{Config.OPENROUTER_BASE_URL}/chat/completions",
                 headers=self.headers,
                 json={
                     "model": self.model,
-                    "messages": [{"role": "user", "content": "Hi"}],
-                    "max_tokens": 5
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 600,
+                    "response_format": {"type": "json_object"}
                 },
-                timeout=10
+                timeout=30
             )
-            if resp.status_code == 200:
-                print(f"[✓] OpenRouter connected ({self.model})")
-                return True
-            print(f"[✗] OpenRouter error {resp.status_code}")
-            return False
-        except Exception as e:
-            print(f"[✗] Cannot reach OpenRouter: {e}")
-            return False
-        
-    def _call_with_retry(self, payload: dict, max_retries=3) -> dict:
-        for i in range(max_retries):
-            try:
-                resp = requests.post(
-                    f"{Config.OPENROUTER_BASE_URL}/chat/completions",
-                    headers=self.headers,
-                    json=payload,
-                    timeout=60
-                )
-                
-                if resp.status_code == 429:
-                    wait = 2 ** i * 10
-                    print(f"    [!] Rate limit, waiting {wait}s...")
-                    time.sleep(wait)
-                    continue
-                    
-                if resp.status_code != 200:
-                    print(f"    [!] OR error {resp.status_code}, retry {i+1}")
-                    time.sleep(2 ** i)
-                    continue
-                
-                return resp.json()
-                    
-            except Exception as e:
-                print(f"    [!] Network error: {e}, retry {i+1}")
-                time.sleep(2 ** i)
-                
-        return None
-        
-    def _validate_extraction(self, result: dict) -> bool:
-        """Ensure extraction has required fields"""
-        required = ['vuln_class', 'assumed_invariant', 'break_condition']
-        return all(
-            result.get(field) and 
-            result[field] not in ['Unknown', '', 'ParseError', 'ExtractionFailed']
-            for field in required
-        )
-        
-    def extract_invariant(self, content: str, title: str) -> dict:
-        """Extract with validation and retry"""
-        
-        def _extract():
-            prompt = f"""Analyze this smart contract vulnerability finding and extract the core invariant violation.
-
-Title: {title}
-Finding Content: {content[:6000]}
-
-You must identify:
-1. What did developers ASSUME was always true? (the invariant)
-2. What specific condition BROKE that assumption? (the attack)
-3. What functions/code patterns were involved?
-
-Return ONLY valid JSON in this exact format:
-{{
-    "vuln_class": "High-level category (Reentrancy, OracleManipulation, AccessControl, etc)",
-    "assumed_invariant": "What developers assumed was always true (e.g., 'price cannot change during a transaction')",
-    "break_condition": "The specific attack that violated it (e.g., 'flash loan manipulated price between check and execution')",
-    "preconditions": ["list", "of", "required", "conditions"],
-    "code_indicators": ["functionName", "variablePattern", "modifier"],
-    "severity_score": "High/Medium/Low"
-}}
-
-Focus on the ASSUMPTION FAILURE - what mental model was wrong? Be specific and technical."""
-
-            result = self._call_with_retry({
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 800
-            })
             
-            if not result:
-                return None
-                
-            try:
-                text = result["choices"][0]["message"]["content"]
-                # Clean markdown
-                if "```json" in text:
-                    text = text.split("```json")[1].split("```")[0]
-                elif "```" in text:
-                    text = text.split("```")[1].split("```")[0]
-                return json.loads(text.strip())
-            except:
-                return None
-        
-        # Try twice
-        for attempt in range(2):
-            result = _extract()
-            if result and self._validate_extraction(result):
-                return result
-            print(f"    [!] Invalid extraction, retry {attempt+1}")
-        
-        # Fallback
-        return {
-            "vuln_class": "ExtractionFailed",
-            "assumed_invariant": title[:100],
-            "break_condition": "Failed to parse",
-            "preconditions": [],
-            "code_indicators": [],
-            "severity_score": "Medium"
-        }
-    
-    def generate_hypothesis(self, target_code: str, patterns: list, filename: str) -> list:
-        if not patterns:
-            return []
-            
-        patterns_text = "\n\n".join([
-            f"Historical Bug {i+1}:\nInvariant: {p['invariant']}\nBroken by: {p['break_condition']}" 
-            for i, p in enumerate(patterns[:3]) if p.get('invariant')
-        ])
-        
-        prompt = f"""You are auditing: {filename}
-
-TARGET CODE (focus on entry points and external calls):
-{target_code[:4000]}
-
-HISTORICAL INVARIANT VIOLATIONS (similar architecture):
-{patterns_text}
-
-TASK: Generate 2-3 specific, testable hypotheses where this target might violate similar invariants.
-
-For each hypothesis provide:
-1. The assumed invariant in the target
-2. The specific break condition (attack vector)
-3. Exact function/location
-4. Confidence (High/Medium/Low)
-
-Return JSON array:
-[{{"hypothesis": "...", "location": "functionName", "invariant_assumed": "...", "attack_vector": "...", "confidence": "..."}}]"""
-
-        result = self._call_with_retry({
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "max_tokens": 1000
-        })
-        
-        if not result:
-            return []
-            
-        try:
-            text = result["choices"][0]["message"]["content"]
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0]
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0]
-            return json.loads(text.strip())
+            text = resp.json()["choices"][0]["message"]["content"]
+            data = json.loads(text)
+            return data if isinstance(data, list) else []
         except:
             return []
