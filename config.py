@@ -11,14 +11,15 @@ class Config:
     
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-    OR_MODEL = os.getenv("OR_MODEL", "upstage/solar-pro")
+    OR_MODEL = os.getenv("OR_MODEL", "arcee-ai/trinity-large-preview:free")
     OR_TEMPERATURE = 0.1
     
     DATA_DIR = Path("./audit_data")
     DB_PATH = DATA_DIR / "findings.db"
-    CHECKPOINT_PATH = DATA_DIR / "checkpoint.json"  # NEW: Resume support
+    CHECKPOINT_PATH = DATA_DIR / "checkpoint.json"
     
-    MAX_DUPLICATES = 3
-    BATCH_SIZE = 50
+    MAX_DUPLICATES = 5  # Based on finders_count
+    BATCH_SIZE = 100    # API max is 100
+    SIMILARITY_THRESHOLD = 0.5  # Lowered for better recall
 
 Config.DATA_DIR.mkdir(parents=True, exist_ok=True)

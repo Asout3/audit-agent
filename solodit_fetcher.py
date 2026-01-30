@@ -12,22 +12,7 @@ class SoloditFetcher:
             "Content-Type": "application/json"
         })
         self.last_request_time = 0
-        self.cache = self._load_checkpoint()
         
-    def _load_checkpoint(self) -> dict:
-        if Config.CHECKPOINT_PATH.exists():
-            with open(Config.CHECKPOINT_PATH) as f:
-                return json.load(f)
-        return {"findings": [], "page": 1, "complete": False}
-    
-    def _save_checkpoint(self, findings: list, page: int):
-        with open(Config.CHECKPOINT_PATH, 'w') as f:
-            json.dump({
-                "findings": findings, 
-                "page": page,
-                "complete": False
-            }, f)
-    
     def validate_api(self) -> bool:
         try:
             self._respect_rate_limit()
@@ -40,9 +25,10 @@ class SoloditFetcher:
                 print("[✗] Invalid Solodit API Key")
                 return False
             if resp.status_code == 200:
-                print("[✓] Solodit API connected")
+                data = resp.json()
+                print(f"[✓] Solodit API connected ({data.get('metadata', {}).get('totalResults', 0)} total findings available)")
                 return True
-            print(f"[✗] Solodit API error: {resp.status_code} - {resp.text[:100]}")
+            print(f"[✗] Solodit error {resp.status_code}: {resp.text[:100]}")
             return False
         except Exception as e:
             print(f"[✗] Cannot reach Solodit: {e}")
@@ -54,35 +40,28 @@ class SoloditFetcher:
             time.sleep(Config.SOLODIT_RATE_LIMIT_DELAY - elapsed)
         self.last_request_time = time.time()
         
-    def fetch_findings(self, protocol_type: Optional[str] = None, severity: Optional[List[str]] = None, 
-                      max_duplicates: int = Config.MAX_DUPLICATES, limit: int = 500) -> List[Dict]:
+    def fetch_findings(self, protocol_type: Optional[str] = None, 
+                      severity: Optional[List[str]] = None, 
+                      limit: int = 300) -> List[Dict]:
         
         findings = []
-        page = self.cache.get("page", 1)
+        page = 1
+        consecutive_errors = 0
         
-        if self.cache.get("complete") and len(self.cache["findings"]) >= limit:
-            print(f"[+] Using cached {len(self.cache['findings'])} findings")
-            return self.cache["findings"][:limit]
-            
-        if self.cache.get("findings"):
-            findings = self.cache["findings"]
-            print(f"[+] Resuming from page {page}: {len(findings)} findings already collected")
-        
-        print(f"[+] Fetching {limit} findings from Solodit...")
+        print(f"[+] Fetching up to {limit} findings from Solodit...")
         
         while len(findings) < limit:
             self._respect_rate_limit()
             
-            # Build filters according to API spec
             filters = {}
             if severity:
-                filters["impact"] = severity  # ["HIGH", "MEDIUM", etc]
+                filters["impact"] = [s.upper() for s in severity]
             if protocol_type:
                 filters["protocolCategory"] = [{"value": protocol_type}]
                 
             payload = {
                 "page": page,
-                "pageSize": min(100, limit - len(findings)),  # Max 100 per request
+                "pageSize": min(Config.BATCH_SIZE, limit - len(findings)),
                 "filters": filters
             }
                 
@@ -94,54 +73,68 @@ class SoloditFetcher:
                 )
                 
                 if resp.status_code == 429:
-                    retry_after = int(resp.headers.get('Retry-After', 60))
-                    print(f"  [!] Rate limited, waiting {retry_after}s...")
-                    time.sleep(retry_after)
+                    reset_time = int(resp.headers.get('X-RateLimit-Reset', 60))
+                    print(f"  [!] Rate limited, waiting {max(reset_time, 60)}s...")
+                    time.sleep(max(reset_time, 60))
                     continue
+                
+                if resp.status_code == 400:
+                    print(f"  [!] Bad request: {resp.text[:200]}")
+                    print(f"      Payload: {json.dumps(payload)[:200]}")
+                    break
                     
                 if resp.status_code != 200:
-                    print(f"  [!] API error {resp.status_code}: {resp.text[:200]}")
+                    consecutive_errors += 1
+                    if consecutive_errors > 3:
+                        print(f"  [!] Too many errors, stopping")
+                        break
+                    print(f"  [!] API error {resp.status_code}, retry...")
                     time.sleep(5)
                     continue
-                    
+                
+                consecutive_errors = 0
                 data = resp.json()
                 batch = data.get("findings", [])
                 
                 if not batch:
                     break
-                    
-                # Filter by duplicate count (from general_score or finders_count)
-                for f in batch:
-                    # Use quality_score or general_score as proxy for rarity
-                    # Or use finders_count (lower = less duplicates)
-                    finders = f.get("finders_count", 1)
-                    if finders <= max_duplicates:
-                        findings.append(f)
-                        if len(findings) >= limit:
-                            break
                 
-                # Check pagination
+                # Filter by rarity (finder count)
+                for f in batch:
+                    finders = f.get("finders_count", 999)
+                    if finders <= Config.MAX_DUPLICATES:
+                        findings.append({
+                            "id": f.get("id"),
+                            "title": f.get("title"),
+                            "content": f.get("content", f.get("summary", "")),
+                            "severity": f.get("impact"),
+                            "protocol": f.get("protocol_name"),
+                            "finders_count": finders,
+                            "quality_score": f.get("quality_score", 0),
+                            "source_link": f.get("source_link")
+                        })
+                    if len(findings) >= limit:
+                        break
+                
                 metadata = data.get("metadata", {})
                 total_pages = metadata.get("totalPages", page)
                 
                 if page >= total_pages:
                     break
                     
-                page += 1
-                print(f"  Progress: {len(findings)}/{limit} (page {page}/{total_pages})")
+                rate_limit = data.get("rateLimit", {})
+                remaining = rate_limit.get("remaining", 20)
                 
-                # Save checkpoint every page
-                if len(findings) % 50 == 0:
-                    self._save_checkpoint(findings, page)
+                if remaining < 3:
+                    print(f"  [!] Rate limit low ({remaining}), pausing 60s...")
+                    time.sleep(60)
+                    
+                page += 1
+                print(f"  Progress: {len(findings)}/{limit} (page {page}/{total_pages}, {len(batch)} this batch)")
                             
             except Exception as e:
-                print(f"  [!] Network error: {e}, saving checkpoint...")
-                self._save_checkpoint(findings, page)
-                time.sleep(10)
+                print(f"  [!] Error: {e}")
+                time.sleep(5)
                 
-        # Mark complete
-        with open(Config.CHECKPOINT_PATH, 'w') as f:
-            json.dump({"findings": findings, "page": page, "complete": True}, f)
-            
-        print(f"[✓] Fetched {len(findings)} high-quality findings")
+        print(f"[✓] Fetched {len(findings) high-quality findings")
         return findings
