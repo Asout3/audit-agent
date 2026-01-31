@@ -26,7 +26,8 @@ class SoloditFetcher:
                 return False
             if resp.status_code == 200:
                 data = resp.json()
-                print(f"[✓] Solodit API connected ({data.get('metadata', {}).get('totalResults', 0)} total findings available)")
+                total = data.get('metadata', {}).get('totalResults', 0)
+                print(f"[✓] Solodit API connected ({total} total findings available)")
                 return True
             print(f"[✗] Solodit error {resp.status_code}: {resp.text[:100]}")
             return False
@@ -55,7 +56,12 @@ class SoloditFetcher:
             
             filters = {}
             if severity:
-                filters["impact"] = [s.upper() for s in severity]
+                # Solodit only accepts: HIGH, MEDIUM, LOW, GAS
+                valid_impacts = ["HIGH", "MEDIUM", "LOW", "GAS"]
+                filtered = [s.upper() for s in severity if s.upper() in valid_impacts]
+                if filtered:
+                    filters["impact"] = filtered
+                    
             if protocol_type:
                 filters["protocolCategory"] = [{"value": protocol_type}]
                 
@@ -99,10 +105,13 @@ class SoloditFetcher:
                 if not batch:
                     break
                 
-                # Filter by rarity (finder count)
+                # Filter by rarity (finder count) - but be more lenient
                 for f in batch:
                     finders = f.get("finders_count", 999)
-                    if finders <= Config.MAX_DUPLICATES:
+                    quality = f.get("quality_score", 3)
+                    
+                    # Accept if: few finders OR high quality
+                    if finders <= Config.MAX_DUPLICATES or quality >= 4:
                         findings.append({
                             "id": f.get("id"),
                             "title": f.get("title"),
@@ -110,7 +119,7 @@ class SoloditFetcher:
                             "severity": f.get("impact"),
                             "protocol": f.get("protocol_name"),
                             "finders_count": finders,
-                            "quality_score": f.get("quality_score", 0),
+                            "quality_score": quality,
                             "source_link": f.get("source_link")
                         })
                     if len(findings) >= limit:
@@ -130,11 +139,11 @@ class SoloditFetcher:
                     time.sleep(60)
                     
                 page += 1
-                print(f"  Progress: {len(findings)}/{limit} (page {page}/{total_pages}, {len(batch)} this batch)")
+                print(f"  Progress: {len(findings)}/{limit} (page {page}/{total_pages})")
                             
             except Exception as e:
                 print(f"  [!] Error: {e}")
                 time.sleep(5)
                 
-        print(f"[✓] Fetched {len(findings) high-quality findings")
+        print(f"[✓] Fetched {len(findings)} high-quality findings")
         return findings

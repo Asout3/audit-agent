@@ -1,8 +1,7 @@
+from typing import List, Dict, Tuple
 from local_db import LocalDB
-from llm_client import LLMClient, ExtractionResult
+from llm_client import LLMClient
 from rich.console import Console
-from rich.panel import Panel
-from typing import List, Dict
 
 console = Console()
 
@@ -11,207 +10,200 @@ class PatternMatcher:
         self.db = LocalDB()
         self.llm = LLMClient()
         
-    def composite_score(self, similarity: float, pattern: dict, static_bug: dict = None) -> tuple:
-        """Calculate confidence: 0-100"""
+    def calculate_confidence(self, similarity: float, pattern: dict, static_findings: list = None) -> Tuple[str, float]:
+        """Calculate confidence score: 0-100"""
         score = 0
         
-        # Similarity component (0-35 pts)
-        score += similarity * 35
+        # Similarity component (max 40)
+        score += similarity * 40
         
-        # Rarity component (0-25 pts) - fewer finders = higher value
+        # Rarity bonus (max 25) - fewer finders = more valuable
         finders = pattern.get('finders_count', 1)
-        score += max(0, 25 - (finders * 3))
+        if finders <= 2:
+            score += 25
+        elif finders <= 5:
+            score += 15
+        else:
+            score += max(0, 10 - finders)
         
-        # Quality component (0-20 pts)
-        quality = pattern.get('quality_score', 3)
+        # Quality bonus (max 20)
+        quality = pattern.get('quality_score', 0)
         score += (quality / 5) * 20
         
-        # Static analysis overlap (0-20 pts)
-        if static_bug:
-            if static_bug['type'].lower() in pattern.get('vuln_class', '').lower():
-                score += 20
+        # Static analysis confirmation (max 15)
+        if static_findings:
+            for sf in static_findings:
+                if sf['type'].lower() in pattern.get('vuln_class', '').lower():
+                    score += 15
+                    break
         
-        if score >= 75:
+        # Boost for high similarity
+        if similarity > 0.75:
+            score += 10
+        
+        if score >= 80:
+            return "Critical", score
+        elif score >= 65:
             return "High", score
-        elif score >= 55:
+        elif score >= 50:
             return "Medium", score
         else:
             return "Low", score
+    
+    def generate_search_query(self, func_data: dict, arch: dict) -> str:
+        """Generate rich search query from function context"""
+        query_parts = [func_data['name']]
         
-    def analyze_target(self, target_files: list, static_analyzer=None):
+        # Add architecture context
+        if arch.get('lending'):
+            query_parts.extend(['borrow', 'collateral', 'liquidation'])
+        if arch.get('perpetual'):
+            query_parts.extend(['funding', 'margin', 'position', 'leverage'])
+        if arch.get('amm'):
+            query_parts.extend(['swap', 'liquidity', 'price'])
+        if arch.get('oracle'):
+            query_parts.extend(['oracle', 'price', 'feed'])
+        
+        # Add indicators
+        indicators = func_data.get('indicators', {})
+        if indicators.get('external_call'):
+            query_parts.append('external call reentrancy')
+        if indicators.get('delegatecall'):
+            query_parts.append('delegatecall injection')
+        if indicators.get('reentrancy_risk'):
+            query_parts.append('state change after call')
+        
+        return ' '.join(query_parts)
+    
+    def analyze_target(self, target_files: list, static_analyzer=None) -> List[Dict]:
+        """Main analysis loop"""
         findings = []
         
-        print("[+] Indexing patterns...")
+        print("[+] Loading pattern database...")
         self.db.load_all_vectors()
-        total, avg_finders, classes = self.db.get_stats()
-        print(f"[+] Database: {total} patterns (avg {avg_finders:.1f} finders)")
+        total, avg_finders, avg_quality, classes = self.db.get_stats()
+        print(f"[+] Database: {total} patterns (avg {avg_finders:.1f} finders, {avg_quality:.1f} quality)")
+        print(f"[+] Top classes: {', '.join([f'{c[0]}({c[1]})' for c in classes[:3]])}")
         
-        # Flatten all functions from all files
-        all_functions = []
-        cross_function_bugs = []
-        
+        # PRIORITY 1: Cross-function vulnerabilities
+        cross_func_findings = []
         for file_data in target_files:
-            if file_data.get("type") == "cross_function_analysis":
-                # Capture cross-function bugs
-                cross_function_bugs.extend([
-                    {**bug, "file": file_data["file"]} 
-                    for bug in file_data.get("bugs", [])
-                ])
-            
-            # Add individual functions
-            for func in file_data.get("functions", []):
+            cross_bugs = file_data.get('cross_function_bugs', [])
+            for bug in cross_bugs:
+                cross_func_findings.append({
+                    "type": f"[bold red]CROSS-FUNCTION {bug['type'].upper()}[/bold red]",
+                    "file": file_data['file'],
+                    "function": bug.get('entry_point', bug.get('function', 'unknown')),
+                    "description": bug['description'],
+                    "attack_path": bug.get('attack_path', ''),
+                    "attack_vector": bug.get('description', ''),
+                    "confidence": "Critical",
+                    "score": 95 if 'reentrancy' in bug['type'] else 85,
+                    "indicators": bug.get('indicators', []),
+                    "matched_patterns": ["cross_function_analysis"]
+                })
+        
+        if cross_func_findings:
+            print(f"[!!!] Found {len(cross_func_findings)} cross-function vulnerabilities")
+            findings.extend(cross_func_findings)
+        
+        # Collect all functions sorted by risk
+        all_functions = []
+        for file_data in target_files:
+            arch = file_data.get('architecture', {})
+            for func in file_data.get('functions', []):
                 all_functions.append({
                     **func,
-                    "file": file_data.get("file", "unknown"),
-                    "cross_bugs": file_data.get("bugs", [])
+                    "file": file_data['file'],
+                    "architecture": arch
                 })
         
-        # PRIORITY 1: Cross-function vulnerabilities (CRITICAL)
-        cross_func_funcs = [f for f in all_functions if f.get("cross_function_vulnerable")]
-        if cross_func_funcs:
-            print(f"[!!!] Found {len(cross_func_funcs)} cross-function vulnerabilities")
-            for func in cross_func_funcs:
-                findings.append({
-                    "type": "[bold red]CROSS-FUNCTION CRITICAL[/bold red]",
-                    "file": func["file"],
-                    "function": func["function"],
-                    "description": "State read in entry point, external call + state write in downstream function",
-                    "attack_path": func.get("external_call_chain", "Unknown chain"),
-                    "confidence": "Critical",
-                    "score": 100
-                })
-        
-        # Also add raw cross-function bugs from analysis
-        for bug in cross_function_bugs:
-            if bug["type"] == "cross_function_reentrancy":
-                findings.append({
-                    "type": "[bold red]CROSS-FUNCTION REENTRANCY[/bold red]",
-                    "file": bug.get("file", "unknown"),
-                    "function": f"{bug.get('entry_point')} → {bug.get('external_call_function')}",
-                    "description": f"Shared state: {', '.join(bug.get('shared_state', []))}",
-                    "attack_path": bug.get("attack_path"),
-                    "confidence": "Critical",
-                    "score": 98
-                })
-            elif bug["type"] == "delegatecall_injection":
-                findings.append({
-                    "type": "[bold red]DELEGATECALL INJECTION[/bold red]",
-                    "file": bug.get("file", "unknown"),
-                    "function": bug.get("function"),
-                    "description": bug.get("description"),
-                    "confidence": "Critical",
-                    "score": 97
-                })
-            elif bug["type"] == "flash_loan_callback_vector":
-                findings.append({
-                    "type": "[bold yellow]FLASH LOAN VECTOR[/bold yellow]",
-                    "file": bug.get("file", "unknown"),
-                    "function": bug.get("function"),
-                    "description": f"Callable from: {', '.join(bug.get('called_by', []))}",
-                    "confidence": "High",
-                    "score": 85
-                })
-        
-        # PRIORITY 2: High-risk function analysis (top 25)
-        high_risk_funcs = sorted(
-            [f for f in all_functions if f.get("risk_score", 0) > 20], 
-            key=lambda x: x.get("risk_score", 0), 
-            reverse=True
-        )[:25]
+        # Sort by risk, take top 30
+        all_functions.sort(key=lambda x: x['risk_score'], reverse=True)
+        high_risk_funcs = [f for f in all_functions if f['risk_score'] > 15][:30]
         
         print(f"[+] Deep analysis on {len(high_risk_funcs)} high-risk functions...")
         
         for i, func in enumerate(high_risk_funcs):
             if i % 5 == 0:
-                console.print(f"  [dim]Analyzing {i+1}/{len(high_risk_funcs)}: {func['function']}[/dim]")
+                console.print(f"  [dim]{i+1}/{len(high_risk_funcs)}: {func['file']}::{func['name']} (risk: {func['risk_score']})[/dim]")
             
-            # Skip if already flagged as cross-function vulnerable
-            if func.get("cross_function_vulnerable"):
-                continue
-            
-            # 1. Static analysis on this specific function
+            # 1. Static analysis
+            static_bugs = []
             if static_analyzer:
-                static_bugs = static_analyzer.analyze(func.get("code", ""), func["function"])
+                static_bugs = static_analyzer.analyze(func['code'], func['name'])
                 for bug in static_bugs:
                     findings.append({
-                        "type": "[red]STATIC CRITICAL[/red]" if bug['severity'] == 'critical' else "[yellow]STATIC HIGH[/yellow]",
-                        "file": f"{func['file']}::{func['function']}",
-                        "description": bug["description"],
-                        "code": bug.get("code", "N/A")[:50],
-                        "confidence": "High",
-                        "score": bug["score"]
+                        "type": f"[red]STATIC {bug['severity'].upper()}[/red]",
+                        "file": f"{func['file']}::{func['name']}",
+                        "description": bug['description'],
+                        "confidence": bug.get('confidence', 'medium'),
+                        "score": bug['score'],
+                        "code_snippet": bug.get('code', '')[:100],
+                        "matched_patterns": []
                     })
             
-            # 2. Slither findings (if available)
-            for bug in func.get("slither_bugs", []):
-                findings.append({
-                    "type": "[bold red]SLITHER CRITICAL[/bold red]" if bug["severity"] == "critical" else "[bold yellow]SLITHER HIGH[/bold yellow]",
-                    "file": f"{func['file']}::{func['function']}",
-                    "description": f"{bug['type']}: {bug.get('details', '')[:100]}",
-                    "location": bug["function"],
-                    "confidence": "High",
-                    "score": 90 if bug["severity"] == "critical" else 75
-                })
+            # 2. Semantic pattern matching
+            search_query = self.generate_search_query(func, func['architecture'])
+            similar = self.db.search_similar(
+                search_query, 
+                top_k=3,
+                min_score=Config.MIN_SIMILARITY
+            )
             
-            # 3. Semantic pattern matching
-            arch = func.get("architecture", {})
-            context = f"{func['function']} {' '.join(func.get('external_calls', []))} {' '.join([k for k, v in arch.items() if v])}"
-            
-            similar = self.db.search_similar(context, top_k=3)
-            
-            # 4. LLM deep analysis for high-similarity matches
-            if similar and similar[0]["similarity"] > 0.55:
-                # Check for historical cross-function patterns
-                cross_func_historical = [s for s in similar if "cross" in s.get("invariant", "").lower() or "function" in s.get("invariant", "").lower()]
-                
-                if cross_func_historical and func.get("external_calls"):
-                    findings.append({
-                        "type": "[bold red]HISTORICAL CROSS-FUNCTION MATCH[/bold red]",
-                        "file": f"{func['file']}::{func['function']}",
-                        "description": f"Matches historical multi-function bug: {cross_func_historical[0]['invariant'][:80]}",
-                        "confidence": "High",
-                        "score": 95
-                    })
-                
-                # Standard hypothesis generation
+            # 3. LLM hypothesis generation for high-similarity matches
+            if similar and similar[0]['similarity'] > 0.45:
                 hypotheses = self.llm.generate_hypothesis(
-                    func.get("code", ""),
+                    func['code'],
                     similar,
-                    func["function"]
+                    func['name']
                 )
                 
                 for h in hypotheses:
-                    conf, score = self.composite_score(
-                        similar[0]["similarity"] if similar else 0.5,
-                        similar[0] if similar else {},
-                        static_bugs[0] if static_bugs else None
+                    conf, score = self.calculate_confidence(
+                        similar[0]['similarity'],
+                        similar[0],
+                        static_bugs
                     )
                     
-                    if h.get("confidence") == "High" or score >= 70:
+                    # High confidence = hypothesis, medium = pattern match
+                    if h.get('confidence') == 'High' or score >= 60:
                         findings.append({
-                            "type": "[bold green]DEEP HYPOTHESIS[/bold green]",
-                            "file": f"{func['file']}::{func['function']}",
-                            "description": h.get("hypothesis", ""),
-                            "location": h.get("location", "Unknown"),
-                            "attack_vector": h.get("attack_vector", ""),
-                            "based_on": h.get("invariant_assumed", ""),
+                            "type": f"[bold yellow]INVARIANT VIOLATION[/bold yellow]",
+                            "file": f"{func['file']}::{func['name']}",
+                            "description": h.get('hypothesis', 'Unknown invariant violation'),
+                            "attack_vector": h.get('attack_vector', ''),
+                            "based_on": f"{similar[0]['invariant'][:80]}...",
                             "confidence": f"{conf} ({score:.0f})",
-                            "score": score
+                            "score": score,
+                            "similarity": similar[0]['similarity'],
+                            "matched_patterns": [similar[0]['invariant']]
                         })
             
-            # 5. Pattern matches (medium confidence)
+            # 4. Direct pattern matches (lower confidence)
             for match in similar[:2]:
-                _, score = self.composite_score(match["similarity"], match)
-                if score >= 50:
-                    findings.append({
-                        "type": "[cyan]PATTERN MATCH[/cyan]",
-                        "file": f"{func['file']}::{func['function']}",
-                        "description": f"Similar to: {match['invariant'][:80]}...",
-                        "break_condition": match.get("break_condition", "")[:80],
-                        "confidence": f"Score: {score:.0f}",
-                        "score": score
-                    })
+                conf, score = self.calculate_confidence(match['similarity'], match, static_bugs)
+                
+                # Only report if score decent and not already reported via hypothesis
+                if score >= 45:
+                    # Check if we already have a better finding for this
+                    existing = [f for f in findings if f['file'] == f"{func['file']}::{func['name']}" and f['score'] > score]
+                    if not existing:
+                        findings.append({
+                            "type": f"[cyan]PATTERN MATCH[/cyan]",
+                            "file": f"{func['file']}::{func['name']}",
+                            "description": f"Similar to: {match['invariant'][:100]}...",
+                            "break_condition": match.get('break_condition', '')[:100],
+                            "confidence": f"{conf} ({score:.0f})",
+                            "score": score,
+                            "similarity": match['similarity'],
+                            "matched_patterns": [match['invariant']],
+                            "original_severity": match.get('severity', 'Unknown')
+                        })
         
-        # Sort by score descending
-        findings.sort(key=lambda x: x.get("score", 0), reverse=True)
+        # Sort by score
+        findings.sort(key=lambda x: x.get('score', 0), reverse=True)
         return findings
+    
+    def get_stats(self):
+        return self.db.get_stats()
