@@ -5,7 +5,7 @@ load_dotenv()
 
 class Config:
     SOLODIT_API_KEY = os.getenv("SOLODIT_API_KEY")
-    SOLODIT_BASE_URL = "https://solodit.cyfrin.io/api/v1"
+    SOLODIT_BASE_URL = "https://solodit.cyfrin.io/api/v1/solodit""
     SOLODIT_RATE_LIMIT_DELAY = 4.0
 
     OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
