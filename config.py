@@ -17,6 +17,7 @@ class Config:
     DB_PATH = DATA_DIR / "patterns.db"
     DATA_DIR.mkdir(exist_ok=True)
 
+    MAX_DUPLICATES = 10 
     BATCH_SIZE = 100
     SIMILARITY_THRESHOLD = 0.38
     RISK_EXTERNAL = 20
