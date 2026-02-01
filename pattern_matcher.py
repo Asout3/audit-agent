@@ -1,5 +1,6 @@
 from local_db import LocalDB
 from llm_client import LLMClient
+from target_analyzer import TargetAnalyzer 
 from rich.table import Table
 from rich.panel import Panel
 from rich.console import Console
