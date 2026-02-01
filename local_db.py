@@ -4,6 +4,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Optional
 from config import Config
+from collections import defaultdict
 
 class LocalDB:
     def __init__(self):

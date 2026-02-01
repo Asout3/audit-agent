@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from solodit_fetcher import SoloditFetcher
@@ -7,9 +9,11 @@ from target_analyzer import TargetAnalyzer
 from pattern_matcher import PatternMatcher
 
 console = Console()
+WORKSPACE_ROOT = Path(__file__).parent.resolve()
 
 class AuditAgent:
     def __init__(self):
+        os.chdir(WORKSPACE_ROOT)  # Ensure correct cwd
         self.fetcher = SoloditFetcher()
         self.llm = LLMClient()
         self.db = LocalDB()
