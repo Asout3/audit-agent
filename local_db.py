@@ -37,8 +37,7 @@ class LocalDB:
                 finders_count INTEGER,
                 raw_title TEXT,
                 source_link TEXT,
-                protocol_category TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                protocol_category TEXT
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_class ON patterns(vuln_class)")
@@ -46,22 +45,22 @@ class LocalDB:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_category ON patterns(protocol_category)")
         self.conn.commit()
         
-    def add_pattern(self, finding_id: str, pattern: dict, severity: str, 
-                    quality_score: float = 0, finders_count: int = 1, 
+    def add_pattern(self, finding_id: str, pattern: dict, severity: str,
+                    quality_score: float = 0, finders_count: int = 1,
                     title: str = "", source_link: str = "", protocol_cat: str = ""):
-        """Add pattern with deduplication check"""
         try:
-            # Check for near-duplicates first
             if self._is_duplicate(pattern):
                 return False
-                
+
             text = f"{pattern.get('assumed_invariant', '')} {pattern.get('break_condition', '')}"
             embedding = self._get_encoder().encode(text, convert_to_numpy=True)
             emb_bytes = embedding.astype(np.float32).tobytes()
-            
+
             cursor = self.conn.cursor()
             cursor.execute("""
-                INSERT OR REPLACE INTO patterns 
+                INSERT OR REPLACE INTO patterns
+                (id, vuln_class, invariant, break_condition, preconditions, code_indicators,
+                 embedding, severity, quality_score, finders_count, raw_title, source_link, protocol_category)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 finding_id,
@@ -81,7 +80,7 @@ class LocalDB:
             self.conn.commit()
             return True
         except Exception as e:
-            print(f"  [!] DB insert error: {e}")
+            print(f"[!] DB insert error: {e}")
             return False
     
     def _is_duplicate(self, pattern: dict, threshold: float = 0.92) -> bool:
