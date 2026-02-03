@@ -8,11 +8,11 @@ from collections import defaultdict
 
 class LocalDB:
     def __init__(self):
-    self.conn = sqlite3.connect(str(Config.DB_PATH))
-    self._init_db()  # Creates table if missing
-    self.encoder = None
-    self._vector_cache = None
-    self._arch_index = defaultdict(list)
+        self.conn = sqlite3.connect(str(Config.DB_PATH))
+        self._init_db()  # Creates table
+        self.encoder = None
+        self._vector_cache = None
+        self._arch_index = defaultdict(list)
         
     def _get_encoder(self):
         """Lazy load encoder"""
