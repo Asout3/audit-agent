@@ -1,10 +1,13 @@
 import requests
 import time
 import json
+import logging
 from typing import List, Dict, Optional
 from config import Config
 
 class SoloditFetcher:
+    """Robust fetcher for Solodit findings with rate-limit and quality filtering"""
+    
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -14,6 +17,8 @@ class SoloditFetcher:
         self.last_request_time = 0
         
     def validate_api(self) -> bool:
+        if not Config.SOLODIT_API_KEY:
+            return False
         try:
             self._respect_rate_limit()
             resp = self.session.post(
@@ -21,18 +26,8 @@ class SoloditFetcher:
                 json={"page": 1, "pageSize": 1},
                 timeout=10
             )
-            if resp.status_code == 401:
-                print("[✗] Invalid Solodit API Key")
-                return False
-            if resp.status_code == 200:
-                data = resp.json()
-                total = data.get('metadata', {}).get('totalResults', 0)
-                print(f"[✓] Solodit API connected ({total} total findings available)")
-                return True
-            print(f"[✗] Solodit error {resp.status_code}: {resp.text[:100]}")
-            return False
-        except Exception as e:
-            print(f"[✗] Cannot reach Solodit: {e}")
+            return resp.status_code == 200
+        except Exception:
             return False
         
     def _respect_rate_limit(self):
@@ -43,20 +38,19 @@ class SoloditFetcher:
         
     def fetch_findings(self, protocol_type: Optional[str] = None, 
                       severity: Optional[List[str]] = None, 
-                      limit: int = 300) -> List[Dict]:
+                      limit: int = 500) -> List[Dict]:
         
         findings = []
         page = 1
         consecutive_errors = 0
         
-        print(f"[+] Fetching up to {limit} findings from Solodit...")
+        print(f"[+] Fetching up to {limit} high-quality findings from Solodit...")
         
         while len(findings) < limit:
             self._respect_rate_limit()
             
             filters = {}
             if severity:
-                # Solodit only accepts: HIGH, MEDIUM, LOW, GAS
                 valid_impacts = ["HIGH", "MEDIUM", "LOW", "GAS"]
                 filtered = [s.upper() for s in severity if s.upper() in valid_impacts]
                 if filtered:
@@ -67,7 +61,7 @@ class SoloditFetcher:
                 
             payload = {
                 "page": page,
-                "pageSize": min(Config.BATCH_SIZE, limit - len(findings)),
+                "pageSize": Config.BATCH_SIZE,
                 "filters": filters
             }
                 
@@ -79,22 +73,12 @@ class SoloditFetcher:
                 )
                 
                 if resp.status_code == 429:
-                    reset_time = int(resp.headers.get('X-RateLimit-Reset', 60))
-                    print(f"  [!] Rate limited, waiting {max(reset_time, 60)}s...")
-                    time.sleep(max(reset_time, 60))
+                    time.sleep(60)
                     continue
                 
-                if resp.status_code == 400:
-                    print(f"  [!] Bad request: {resp.text[:200]}")
-                    print(f"      Payload: {json.dumps(payload)[:200]}")
-                    break
-                    
                 if resp.status_code != 200:
                     consecutive_errors += 1
-                    if consecutive_errors > 3:
-                        print(f"  [!] Too many errors, stopping")
-                        break
-                    print(f"  [!] API error {resp.status_code}, retry...")
+                    if consecutive_errors > 3: break
                     time.sleep(5)
                     continue
                 
@@ -102,15 +86,12 @@ class SoloditFetcher:
                 data = resp.json()
                 batch = data.get("findings", [])
                 
-                if not batch:
-                    break
+                if not batch: break
                 
-                # Filter by rarity (finder count) - but be more lenient
                 for f in batch:
                     finders = f.get("finders_count", 999)
                     quality = f.get("quality_score", 3)
                     
-                    # Accept if: few finders OR high quality
                     if finders <= Config.MAX_DUPLICATES or quality >= 4:
                         findings.append({
                             "id": f.get("id"),
@@ -122,28 +103,17 @@ class SoloditFetcher:
                             "quality_score": quality,
                             "source_link": f.get("source_link")
                         })
-                    if len(findings) >= limit:
-                        break
+                    if len(findings) >= limit: break
                 
                 metadata = data.get("metadata", {})
-                total_pages = metadata.get("totalPages", page)
-                
-                if page >= total_pages:
-                    break
-                    
-                rate_limit = data.get("rateLimit", {})
-                remaining = rate_limit.get("remaining", 20)
-                
-                if remaining < 3:
-                    print(f"  [!] Rate limit low ({remaining}), pausing 60s...")
-                    time.sleep(60)
-                    
+                if page >= metadata.get("totalPages", page): break
                 page += 1
-                print(f"  Progress: {len(findings)}/{limit} (page {page}/{total_pages})")
                             
             except Exception as e:
-                print(f"  [!] Error: {e}")
+                logging.error(f"Solodit fetch error: {e}")
                 time.sleep(5)
                 
-        print(f"[✓] Fetched {len(findings)} high-quality findings")
+        # Final ranking by quality and rarity
+        findings.sort(key=lambda x: (x.get('quality_score', 0), -(x.get('finders_count', 999))), reverse=True)
+        print(f"[✓] Successfully retrieved {len(findings)} patterns")
         return findings
