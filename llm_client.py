@@ -1,7 +1,8 @@
 import json
 import time
-from dataclasses import dataclass
-from typing import List, Dict
+import logging
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Any, Iterator
 from groq import Groq
 from config import Config
 
@@ -14,70 +15,94 @@ class ExtractionResult:
     code_indicators: List[str]
     severity_score: str
 
+@dataclass
+class HypothesisResult:
+    hypothesis: str
+    attack_vector: str
+    confidence: str
+    invariant_assumed: str
+    location: str
+    remediation: str = ""
+    vulnerability_type: str = ""
+
 class LLMClient:
+    """Robust Groq SDK client for smart contract analysis"""
+    
     def __init__(self):
         self.api_key = Config.GROQ_API_KEY
         if not self.api_key:
-            raise ValueError("GROQ_API_KEY not set in environment")
+            logging.error("GROQ_API_KEY not set in environment")
+            # We don't raise here to allow the CLI to show help or other info before failing
         self.model = Config.GROQ_MODEL
-        self.client = Groq(api_key=self.api_key)
+        try:
+            self.client = Groq(api_key=self.api_key) if self.api_key else None
+        except Exception as e:
+            logging.error(f"Failed to initialize Groq client: {e}")
+            self.client = None
         
     def validate(self) -> bool:
         """Test Groq connection"""
+        if not self.client:
+            return False
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=[{"role": "user", "content": "Say hi"}],
+                messages=[{"role": "user", "content": "Respond with 'connected'"}],
                 max_tokens=5
             )
-            if response.choices[0].message.content:
-                print(f"[✓] Groq connected ({self.model})")
+            content = response.choices[0].message.content.strip().lower()
+            if 'connected' in content:
                 return True
-            print(f"[✗] Groq returned empty response")
             return False
         except Exception as e:
-            print(f"[✗] Cannot reach Groq: {e}")
+            logging.error(f"Cannot reach Groq: {e}")
             return False
     
-    def _call_with_retry(self, messages: List[Dict], max_retries: int = None, **kwargs) -> Dict:
-        """Make API call with exponential backoff"""
-        if max_retries is None:
-            max_retries = Config.GROQ_MAX_RETRIES
+    def _call_with_retry(self, messages: List[Dict], stream: bool = False, **kwargs) -> Any:
+        """Make API call with exponential backoff and rate limit handling"""
+        if not self.client:
+            raise ValueError("Groq client not initialized. Check your API key.")
             
+        max_retries = kwargs.pop('max_retries', Config.GROQ_MAX_RETRIES)
+        
         for i in range(max_retries):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     timeout=Config.GROQ_TIMEOUT,
+                    stream=stream,
                     **kwargs
                 )
-                return {
-                    "choices": [{
-                        "message": {
-                            "content": response.choices[0].message.content
-                        }
-                    }]
-                }
+                return response
             except Exception as e:
                 error_str = str(e).lower()
-                if 'rate' in error_str or 'limit' in error_str:
+                if 'rate' in error_str or 'limit' in error_str or '429' in error_str:
                     wait = 2 ** (i + 2)
-                    print(f"    [!] Rate limited, waiting {wait}s...")
+                    logging.warning(f"Rate limited, waiting {wait}s...")
                     time.sleep(wait)
                     continue
                 elif i < max_retries - 1:
-                    print(f"    [!] Groq error: {e}, retry {i+1}/{max_retries}")
+                    logging.warning(f"Groq error: {e}, retry {i+1}/{max_retries}")
                     time.sleep(2 ** i)
                     continue
                 else:
-                    print(f"    [!] Groq error after {max_retries} retries: {e}")
+                    logging.error(f"Groq error after {max_retries} retries: {e}")
+                    raise
         
         return None
     
+    def get_completion_stream(self, messages: List[Dict], **kwargs) -> Iterator[str]:
+        """Get streaming completion from Groq"""
+        response = self._call_with_retry(messages, stream=True, **kwargs)
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
     def _strict_parse(self, text: str) -> ExtractionResult:
-        """Parse LLM response with multiple fallback strategies"""
+        """Parse LLM response for invariant extraction"""
         try:
+            # Clean up potential markdown blocks
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0]
             elif "```" in text:
@@ -85,268 +110,134 @@ class LLMClient:
             
             data = json.loads(text.strip())
             
-            def clean_str(s):
-                if not s or not isinstance(s, str):
-                    return ""
-                return s.strip()
-            
-            vuln_class = clean_str(data.get('vuln_class', 'Unknown'))
-            if not vuln_class or vuln_class.lower() in ['unknown', 'n/a', 'none']:
-                vuln_class = self._infer_vuln_class(data.get('assumed_invariant', '') + data.get('break_condition', ''))
-            
-            invariant = clean_str(data.get('assumed_invariant', ''))
-            if len(invariant) < 10:
-                raise ValueError("Invariant too short")
-            
-            break_cond = clean_str(data.get('break_condition', ''))
-            if len(break_cond) < 10:
-                raise ValueError("Break condition too short")
-            
-            preconditions = data.get('preconditions', [])
-            if not isinstance(preconditions, list):
-                preconditions = [str(preconditions)] if preconditions else []
-            preconditions = [p.strip() for p in preconditions if p and len(str(p)) > 2]
-            
-            code_indicators = data.get('code_indicators', [])
-            if not isinstance(code_indicators, list):
-                code_indicators = [str(code_indicators)] if code_indicators else []
-            code_indicators = [c.strip() for c in code_indicators if c and len(str(c)) > 1]
-            
-            severity = data.get('severity_score', 'Medium')
-            if severity not in ['High', 'Medium', 'Low']:
-                severity = 'Medium'
-            
             return ExtractionResult(
-                vuln_class=vuln_class,
-                assumed_invariant=invariant,
-                break_condition=break_cond,
-                preconditions=preconditions,
-                code_indicators=code_indicators,
-                severity_score=severity
+                vuln_class=data.get('vuln_class', 'LogicError'),
+                assumed_invariant=data.get('assumed_invariant', 'Unknown'),
+                break_condition=data.get('break_condition', 'Unknown'),
+                preconditions=data.get('preconditions', []),
+                code_indicators=data.get('code_indicators', []),
+                severity_score=data.get('severity_score', 'Medium')
             )
-            
-        except (json.JSONDecodeError, ValueError, KeyError) as e:
+        except Exception as e:
+            logging.error(f"Parse failed: {e}")
             raise ValueError(f"Parse failed: {e}")
-    
-    def _infer_vuln_class(self, text: str) -> str:
-        """Infer vulnerability class from text"""
-        text = text.lower()
-        if any(w in text for w in ['reentrancy', 're-entrancy', 'reentrant']):
-            return "Reentrancy"
-        elif any(w in text for w in ['oracle', 'price', 'feed', 'chainlink']):
-            return "OracleManipulation"
-        elif any(w in text for w in ['access', 'permission', 'auth', 'onlyowner']):
-            return "AccessControl"
-        elif any(w in text for w in ['flash', 'loan', 'flashloan']):
-            return "FlashLoan"
-        elif any(w in text for w in ['rounding', 'precision', 'division']):
-            return "PrecisionLoss"
-        elif any(w in text for w in ['delegatecall', 'delegate']):
-            return "DelegatecallInjection"
-        elif any(w in text for w in ['integer', 'overflow', 'underflow']):
-            return "IntegerOverflow"
-        elif any(w in text for w in ['dos', 'denial', 'gas', 'unbounded']):
-            return "DoS"
-        return "LogicError"
-    
-    def extract_invariant(self, content: str, title: str, max_retries: int = 3) -> ExtractionResult:
-        """Extract invariant with aggressive retry and repair"""
-        
-        base_prompt = f"""Analyze this smart contract vulnerability and extract the invariant violation that the developer assumed was true.
 
+    def extract_invariant(self, content: str, title: str) -> ExtractionResult:
+        """Extract invariant with retry logic"""
+        prompt = f"""Analyze this smart contract vulnerability and extract the invariant violation.
 Title: {title}
-Content: {content[:7500]}
-
-Identify:
-1. What class of vulnerability is this (one or two words)?
-2. What did the developer assume was invariant/always true?
-3. What specific condition broke that invariant?
-4. What code patterns indicate this vulnerability?
-5. What preconditions must exist for the attack?
+Content: {content[:7000]}
 
 Return valid JSON:
 {{
-    "vuln_class": "CategoryName",
-    "assumed_invariant": "Complete sentence describing the assumption",
-    "break_condition": "Complete sentence describing how it was broken",
-    "preconditions": ["array", "of", "conditions"],
-    "code_indicators": ["functionName", "variablePattern"],
+    "vuln_class": "e.g., Reentrancy",
+    "assumed_invariant": "Assumed that...",
+    "break_condition": "How it broke...",
+    "preconditions": ["cond1", "cond2"],
+    "code_indicators": ["pattern1"],
     "severity_score": "High/Medium/Low"
-}}
+}}"""
 
-Rules:
-- assumed_invariant MUST start with "Assumed that..." or "Developers assumed..."
-- break_condition MUST describe the attack mechanism
-- preconditions must be strings describing state prerequisites
-- vuln_class examples: Reentrancy, OracleManipulation, AccessControl, FlashLoan, PrecisionLoss, DelegatecallInjection"""
+        try:
+            response = self._call_with_retry(
+                [{"role": "user", "content": prompt}],
+                temperature=0.05,
+                response_format={"type": "json_object"}
+            )
+            return self._strict_parse(response.choices[0].message.content)
+        except Exception:
+            return self._emergency_extraction(content, title)
 
-        for attempt in range(max_retries):
-            try:
-                result = self._call_with_retry(
-                    [{"role": "user", "content": base_prompt}],
-                    temperature=Config.GROQ_TEMPERATURE,
-                    max_tokens=800,
-                    response_format={"type": "json_object"}
-                )
-                
-                if result:
-                    text = result["choices"][0]["message"]["content"]
-                    return self._strict_parse(text)
-                    
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    break
-                time.sleep(2 ** attempt)
-        
-        return self._emergency_extraction(content, title)
-    
     def _emergency_extraction(self, content: str, title: str) -> ExtractionResult:
-        """Last resort extraction using simple heuristics"""
-        content_lower = (content + title).lower()
-        
-        vuln_type = self._infer_vuln_class(content_lower)
-        
-        sentences = content.replace('\n', ' ').split('. ')
-        first_real = title
-        for s in sentences:
-            if len(s) > 20 and 'function' not in s.lower()[:10]:
-                first_real = s.strip()
-                break
-        
         return ExtractionResult(
-            vuln_class=vuln_type,
-            assumed_invariant=f"Developers assumed {first_real[:120]}",
-            break_condition="Invariant violated due to unexpected interaction or edge case",
+            vuln_class="LogicError",
+            assumed_invariant=f"Developers assumed {title[:100]}",
+            break_condition="Unknown violation",
             preconditions=[],
             code_indicators=[],
             severity_score="Medium"
         )
-    
+
     def generate_hypothesis(self, target_code: str, patterns: List[Dict], func_name: str) -> List[Dict]:
         """Generate vulnerability hypotheses based on similar patterns"""
         if not patterns:
             return []
             
-        top_patterns = patterns[:2]
         context = "\n\n".join([
-            f"Historical Bug {i+1}:\nInvariant: {p.get('invariant', 'Unknown')}\nBroken by: {p.get('break_condition', 'Unknown')[:200]}"
-            for i, p in enumerate(top_patterns) if p.get('invariant')
+            f"Pattern {i+1}:\nInvariant: {p.get('invariant')}\nBreak: {p.get('break_condition')}"
+            for i, p in enumerate(patterns[:Config.PATTERNS_PER_CALL])
         ])
         
-        prompt = f"""Analyze this function for the same invariant violation patterns seen in historical bugs.
-
-Function: {func_name}
-Code:
-{target_code[:2500]}
-
-Historical patterns to check against:
+        prompt = f"""Analyze function '{func_name}' for bugs similar to these historical patterns:
 {context}
 
-Does this function make similar dangerous assumptions? Return JSON array with up to 2 findings:
+Function Code:
+{target_code[:3000]}
+
+Return a JSON array of findings:
 [
   {{
-    "hypothesis": "Specific description of the potential bug",
-    "attack_vector": "How an attacker would exploit it",
+    "hypothesis": "Description",
+    "attack_vector": "Step-by-step",
     "confidence": "High/Medium/Low",
-    "invariant_assumed": "What the code assumes",
-    "location": "Specific line or condition"
+    "invariant_assumed": "Assumption",
+    "location": "Line/Condition",
+    "remediation": "Fix",
+    "vulnerability_type": "Class"
   }}
-]
-
-If no match, return empty array []."""
-
-        try:
-            result = self._call_with_retry(
-                [{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=600,
-                response_format={"type": "json_object"},
-                max_retries=2
-            )
-            
-            if result:
-                text = result["choices"][0]["message"]["content"]
-                data = json.loads(text)
-                return data if isinstance(data, list) else []
-        except Exception as e:
-            print(f"  [!] Hypothesis generation failed: {e}")
-        
-        return []
-    
-    def batch_extract(self, findings: List[Dict], batch_size: int = 3) -> List[Dict]:
-        """Extract invariants for multiple findings in one call (faster)"""
-        results = []
-        
-        for i in range(0, len(findings), batch_size):
-            batch = findings[i:i+batch_size]
-            
-            batch_text = "\n\n---\n\n".join([
-                f"FINDING {j}:\nTitle: {f.get('title', '')}\nContent: {f.get('content', '')[:1500]}"
-                for j, f in enumerate(batch)
-            ])
-            
-            prompt = f"""Extract invariants for {len(batch)} findings. Return JSON array of {len(batch)} objects.
-
-{batch_text}
-
-Return exactly this format:
-[
-  {{
-    "vuln_class": "...",
-    "assumed_invariant": "...",
-    "break_condition": "...",
-    "preconditions": [],
-    "code_indicators": [],
-    "severity_score": "..."
-  }},
-  ...repeat for each finding...
 ]"""
 
+        try:
+            response = self._call_with_retry(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            text = response.choices[0].message.content
+            data = json.loads(text)
+            if isinstance(data, dict) and "findings" in data:
+                return data["findings"]
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logging.error(f"Hypothesis generation failed: {e}")
+            return []
+
+    def batch_extract(self, findings: List[Dict], batch_size: int = 5) -> List[Dict]:
+        """Batch extract invariants for efficiency"""
+        results = []
+        for i in range(0, len(findings), batch_size):
+            batch = findings[i:i+batch_size]
+            prompt = f"Extract invariants for these {len(batch)} findings. Return JSON array of objects.\n\n"
+            for j, f in enumerate(batch):
+                prompt += f"FINDING {j}: {f.get('title')}\n{f.get('content')[:1000]}\n---\n"
+            
             try:
-                result = self._call_with_retry(
+                response = self._call_with_retry(
                     [{"role": "user", "content": prompt}],
                     temperature=0.0,
-                    max_tokens=1200,
-                    response_format={"type": "json_object"},
-                    max_retries=2
+                    response_format={"type": "json_object"}
                 )
+                data = json.loads(response.choices[0].message.content)
+                items = data if isinstance(data, list) else data.get("extractions", [])
                 
-                if result:
-                    text = result["choices"][0]["message"]["content"]
-                    data = json.loads(text)
-                    if isinstance(data, list) and len(data) == len(batch):
-                        for idx, item in enumerate(data):
-                            try:
-                                inv = item.get('assumed_invariant', '')
-                                if len(inv) < 5:
-                                    raise ValueError("Too short")
-                                results.append({
-                                    "finding": batch[idx],
-                                    "extraction": ExtractionResult(
-                                        vuln_class=item.get('vuln_class', 'Unknown'),
-                                        assumed_invariant=inv,
-                                        break_condition=item.get('break_condition', ''),
-                                        preconditions=item.get('preconditions', []),
-                                        code_indicators=item.get('code_indicators', []),
-                                        severity_score=item.get('severity_score', 'Medium')
-                                    )
-                                })
-                            except:
-                                results.append({
-                                    "finding": batch[idx],
-                                    "extraction": self._emergency_extraction(
-                                        batch[idx].get('content', ''),
-                                        batch[idx].get('title', '')
-                                    )
-                                })
-                        continue
-            except Exception as e:
-                print(f"  [!] Batch extraction failed: {e}")
-            
-            for f in batch:
-                results.append({
-                    "finding": f,
-                    "extraction": self.extract_invariant(f.get('content', ''), f.get('title', ''))
-                })
-        
+                for idx, item in enumerate(items):
+                    if idx < len(batch):
+                        results.append({
+                            "finding": batch[idx],
+                            "extraction": ExtractionResult(
+                                vuln_class=item.get('vuln_class', 'Unknown'),
+                                assumed_invariant=item.get('assumed_invariant', 'Unknown'),
+                                break_condition=item.get('break_condition', 'Unknown'),
+                                preconditions=item.get('preconditions', []),
+                                code_indicators=item.get('code_indicators', []),
+                                severity_score=item.get('severity_score', 'Medium')
+                            )
+                        })
+            except Exception:
+                # Fallback to individual extraction
+                for f in batch:
+                    results.append({
+                        "finding": f,
+                        "extraction": self.extract_invariant(f.get('content', ''), f.get('title', ''))
+                    })
         return results

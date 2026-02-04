@@ -1,3 +1,4 @@
+from typing import List, Dict
 from local_db import LocalDB
 from llm_client import LLMClient
 from target_analyzer import TargetAnalyzer
@@ -6,160 +7,169 @@ from call_graph import CallGraphAnalyzer
 from rich.table import Table
 from rich.panel import Panel
 from rich.console import Console
+from rich.syntax import Syntax
+from config import Config
+
 console = Console()
 
 class PatternMatcher:
+    """Combines multiple analysis techniques into a unified finding report"""
+    
     def __init__(self):
         self.db = LocalDB()
         self.llm = LLMClient()
 
-    def analyze(self, analyzer: TargetAnalyzer, sniper: bool = False) -> list:
+    def analyze(self, analyzer: TargetAnalyzer, sniper: bool = False) -> List[Dict]:
         findings = []
         
-        # 1. Run Slither detectors
+        # 1. Slither detectors
         detectors = analyzer.get_detectors()
         for d in detectors:
             for result in d["instances"]:
                 findings.append({
-                    "type": f"[red]SLITHER {d['check']}[/red]",
+                    "type": f"SLITHER_{d['check'].upper()}",
+                    "severity": d['impact'].lower(),
                     "file": result["source_mapping"]["filename"],
                     "description": d["description"],
-                    "score": 80 if "high" in d["impact"].lower() else 60,
+                    "score": 85 if "high" in d["impact"].lower() else 65,
+                    "confidence": "high",
+                    "location": f"{result['source_mapping']['filename']}:{result['source_mapping']['lines'][0]}",
+                    "source": "Slither"
                 })
 
-        # 2. Run static analysis on high-risk functions
-        console.print("[+] Running static analysis...")
+        # 2. Static Analysis
         static_analyzer = StaticAnalyzer()
         funcs = analyzer.get_functions()
-        
         for func in funcs:
-            code = func.get('code', '')
-            if code:
-                static_findings = static_analyzer.analyze(code, f"{func['contract']}::{func['function']}")
+            if func.get('code'):
+                static_findings = static_analyzer.analyze(func['code'], func['function'])
                 for sf in static_findings:
                     findings.append({
-                        "type": f"[cyan]STATIC {sf['type'].upper()}[/cyan]",
+                        "type": sf['type'].upper(),
+                        "severity": sf['severity'],
                         "file": f"{func['contract']}::{func['function']}",
                         "description": sf['description'],
                         "score": sf['score'],
+                        "confidence": sf.get('confidence', 'medium'),
+                        "remediation": sf.get('remediation', ''),
+                        "code_snippet": func['code'][:500],
+                        "source": "StaticAnalyzer"
                     })
-        
-        # 3. Run call graph analysis for cross-function bugs
-        console.print("[+] Running call graph analysis...")
+
+        # 3. Call Graph Analysis
         try:
-            call_graph = CallGraphAnalyzer(str(analyzer.project_path))
-            if call_graph.build_graph():
-                # Cross-function reentrancy
-                cf_reentrancy = call_graph.find_cross_function_reentrancy()
+            cg_analyzer = CallGraphAnalyzer(str(analyzer.project_path))
+            if cg_analyzer.build_graph():
+                cf_reentrancy = cg_analyzer.find_cross_function_reentrancy()
                 for cf in cf_reentrancy:
                     findings.append({
-                        "type": "[bold magenta]CROSS-FUNCTION REENTRANCY[/bold magenta]",
+                        "type": "CROSS_FUNCTION_REENTRANCY",
+                        "severity": "critical",
                         "file": cf['entry_point'],
                         "description": cf['description'],
                         "attack_vector": cf['attack_path'],
                         "score": 90,
+                        "confidence": "high",
+                        "source": "CallGraph"
                     })
                 
-                # Delegatecall injection via call graph
-                delegate_inj = call_graph.find_delegatecall_injection()
+                delegate_inj = cg_analyzer.find_delegatecall_injection()
                 for di in delegate_inj:
                     findings.append({
-                        "type": "[bold red]DELEGATECALL INJECTION[/bold red]",
+                        "type": "DELEGATECALL_INJECTION",
+                        "severity": "critical",
                         "file": di['function'],
                         "description": di['description'],
                         "score": 95,
+                        "confidence": "high",
+                        "source": "CallGraph"
                     })
-                
-                # Flash loan vectors
-                flash_vectors = call_graph.find_flash_loan_entry_points()
-                for fv in flash_vectors:
-                    findings.append({
-                        "type": "[yellow]FLASH LOAN VECTOR[/yellow]",
-                        "file": fv['function'],
-                        "description": f"{fv['description']} (called by: {', '.join(fv['called_by'][:3])})",
-                        "score": 75,
-                    })
-        except Exception as e:
-            console.print(f"[!] Call graph analysis failed: {e}")
-        
-        # 4. Deep semantic analysis with LLM
-        console.print(f"[+] Deep analysis on {len(funcs)} high-risk functions")
-        self.db.load_all_vectors()
+        except Exception:
+            pass
 
-        for i, func in enumerate(funcs):
-            query = f"{func['contract']} {func['function']} {func['signature']}"
-            similar = self.db.search_similar(query, top_k=3)
-            if similar and similar[0]["similarity"] > 0.40:
+        # 4. Semantic Matching + LLM Hypotheses
+        self.db.load_all_vectors()
+        for func in funcs[:50]:
+            query = f"{func['contract']} {func['function']} {func.get('signature', '')}"
+            similar = self.db.search_similar(query, top_k=Config.PATTERNS_PER_CALL)
+            
+            if similar and similar[0]["similarity"] > Config.SIMILARITY_THRESHOLD:
                 hyps = self.llm.generate_hypothesis(func["code"], similar, func["function"])
                 for h in hyps:
                     findings.append({
-                        "type": "[bold yellow]INVARIANT[/bold yellow]",
+                        "type": h.get("vulnerability_type", "INVARIANT_VIOLATION").upper(),
+                        "severity": h.get("confidence", "Medium").lower(),
                         "file": f"{func['contract']}::{func['function']}",
                         "description": h.get("hypothesis", ""),
                         "attack_vector": h.get("attack_vector", ""),
-                        "score": 75,
+                        "confidence": h.get("confidence", "Medium"),
+                        "remediation": h.get("remediation", ""),
+                        "location": h.get("location", ""),
+                        "score": 75 if h.get("confidence") == "High" else 55,
+                        "code_snippet": func["code"][:500],
+                        "source": "SemanticMatcher"
                     })
 
-        # 5. Enhanced risk scoring - boost score for patterns from multiple analyzers
-        findings = self._enhance_risk_scores(findings)
+        findings = self._deduplicate_and_score(findings)
         
-        findings.sort(key=lambda x: x["score"], reverse=True)
         if sniper:
-            findings = [f for f in findings if f["score"] >= 70]
-        return findings
-    
-    def _enhance_risk_scores(self, findings: list) -> list:
-        """Boost scores for findings corroborated by multiple analyzers"""
-        # Group findings by file/function
-        location_groups = {}
+            findings = [f for f in findings if f["score"] >= 80]
+            
+        return sorted(findings, key=lambda x: x["score"], reverse=True)
+
+    def _deduplicate_and_score(self, findings: List[Dict]) -> List[Dict]:
+        unique_findings = []
+        seen_keys = {}
+        
         for f in findings:
-            loc = f["file"]
-            if loc not in location_groups:
-                location_groups[loc] = []
-            location_groups[loc].append(f)
-        
-        # Boost scores for locations with multiple findings
-        for loc, loc_findings in location_groups.items():
-            if len(loc_findings) > 1:
-                for f in loc_findings:
-                    # 10% boost for corroborated findings
-                    f["score"] = min(100, int(f["score"] * 1.1))
-        
-        return findings
+            key = (f["file"], f["type"])
+            if key in seen_keys:
+                idx = seen_keys[key]
+                unique_findings[idx]["score"] = min(100, int(unique_findings[idx]["score"] * 1.2))
+                unique_findings[idx]["source"] += f" + {f['source']}"
+            else:
+                seen_keys[key] = len(unique_findings)
+                unique_findings.append(f)
+                
+        return unique_findings
 
-    def display(self, results: list):
+    def display(self, results: List[Dict]):
         if not results:
-            console.print("[yellow]No high-confidence findings[/yellow]")
+            console.print("[yellow]No findings discovered.[/yellow]")
             return
-        console.print(f"[bold green]Found {len(results)} issues[/bold green]")
-        for r in results[:25]:
-            extra_info = ""
-            if "attack_vector" in r:
-                extra_info = f"\n[dim]Attack:[/dim] {r['attack_vector']}"
-            console.print(Panel(
-                f"[bold]{r['description']}[/bold]\n[dim]File:[/dim] {r['file']}\n[dim]Score:[/dim] {r['score']}{extra_info}",
-                title=r["type"],
-                border_style="red" if r["score"] >= 80 else "yellow" if r["score"] >= 60 else "blue"
-            ))
 
-        table = Table(title="Severity Summary")
-        table.add_column("Level")
-        table.add_column("Count")
-        high = len([r for r in results if r["score"] >= 70])
-        med = len([r for r in results if 50 <= r["score"] < 70])
-        low = len([r for r in results if r["score"] < 50])
-        table.add_row("High (70+)", str(high))
-        table.add_row("Medium (50-69)", str(med))
-        table.add_row("Low (<50)", str(low))
-        console.print(table)
-        
-        # Show analyzer breakdown
-        breakdown = {}
         for r in results:
-            analyzer_type = r["type"].split("]")[0].strip("[]").split()[0]
-            breakdown[analyzer_type] = breakdown.get(analyzer_type, 0) + 1
+            severity = r.get("severity", "medium").lower()
+            color = "red" if any(x in severity for x in ["crit", "high"]) else "orange3" if "med" in severity else "blue"
+            icon = "🔴" if any(x in severity for x in ["crit", "high"]) else "🟠" if "med" in severity else "🟡"
+            
+            panel_title = f"{icon} {r['type']} (Confidence: {r.get('confidence', 'N/A')})"
+            
+            content = f"[bold]Location:[/bold] {r['file']}\n"
+            content += f"[bold]Detected By:[/bold] {r.get('source', 'Unknown')}\n\n"
+            content += f"[bold]Description:[/bold]\n{r['description']}\n\n"
+            
+            if r.get("attack_vector"):
+                content += f"[bold]⚔️ Attack Vector:[/bold]\n{r['attack_vector']}\n\n"
+            
+            if r.get("remediation"):
+                content += f"[bold]✅ Remediation:[/bold]\n{r['remediation']}\n\n"
+                
+            console.print(Panel(content, title=panel_title, border_style=color))
+            if r.get("code_snippet"):
+                snippet = Syntax(r["code_snippet"], "solidity", theme="monokai", line_numbers=True)
+                console.print(snippet)
+            console.print("═" * 80)
+
+        table = Table(title="Audit Summary")
+        table.add_column("Severity", justify="left")
+        table.add_column("Count", justify="right")
         
-        if len(breakdown) > 1:
-            console.print("\n[bold]Analyzer Breakdown:[/bold]")
-            for analyzer, count in sorted(breakdown.items(), key=lambda x: x[1], reverse=True):
-                console.print(f"  {analyzer}: {count}")
+        crit = len([f for f in results if any(x in f.get("severity", "").lower() for x in ["crit", "high"])])
+        med = len([f for f in results if "med" in f.get("severity", "").lower()])
+        low = len([f for f in results if "low" in f.get("severity", "").lower()])
+        
+        table.add_row("🔴 Critical/High", str(crit), style="red")
+        table.add_row("🟠 Medium", str(med), style="orange3")
+        table.add_row("🔵 Low", str(low), style="blue")
+        console.print(table)
