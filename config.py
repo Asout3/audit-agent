@@ -32,3 +32,20 @@ class Config:
     RISK_STORAGE_COLLISION = 30
     RISK_APPROVAL_DOUBLE_SPEND = 50
     RISK_WEAK_RANDOMNESS = 35
+    
+    # Logging configuration
+    LOG_FILE = "audit.log"
+    LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
+    LOG_BACKUP_COUNT = 5
+    
+    # Cache configuration
+    CACHE_DIR = DATA_DIR / "cache"
+    CACHE_MAX_SIZE = 100 * 1024 * 1024  # 100MB
+    CACHE_TTL_HOURS = 168  # 7 days
+    
+    # Test generation
+    TEST_CONFIDENCE_THRESHOLD = 80
+    FOUNDRY_TEST_DIR = "test/exploits"
+    
+    # Resume capability
+    PROGRESS_FILE = DATA_DIR / "audit_progress.json"
