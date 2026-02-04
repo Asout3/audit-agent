@@ -37,10 +37,17 @@ class LocalDB:
                 finders_count INTEGER,
                 raw_title TEXT,
                 source_link TEXT,
-                protocol_category TEXT
+                protocol_category TEXT,
+                confidence_score REAL DEFAULT 0.5,
+                protocol_tags TEXT,
+                source_quality TEXT DEFAULT 'community',
+                exploit_complexity TEXT DEFAULT 'medium',
+                financial_impact TEXT
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_class ON patterns(vuln_class)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_confidence ON patterns(confidence_score)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_complexity ON patterns(exploit_complexity)")
         self.conn.commit()
         
     def add_pattern(self, title: str, content: str, invariant: str, break_condition: str, 

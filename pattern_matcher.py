@@ -19,7 +19,8 @@ class PatternMatcher:
         self.db = LocalDB()
         self.llm = LLMClient()
 
-    def analyze(self, analyzer: TargetAnalyzer, sniper: bool = False) -> List[Dict]:
+    def analyze(self, analyzer: TargetAnalyzer, sniper: bool = False, 
+                cross_contract: bool = False, progress: Optional[Dict] = None) -> List[Dict]:
         findings = []
         
         # 1. Slither detectors
@@ -132,6 +133,42 @@ class PatternMatcher:
                 unique_findings.append(f)
                 
         return unique_findings
+    
+    def _deduplicate(self, findings: List[Dict]) -> List[Dict]:
+        """Deduplicate findings, keeping highest scoring ones"""
+        unique_findings = {}
+        
+        for f in findings:
+            key = (f.get("type"), f.get("file"), f.get("description"))
+            
+            if key in unique_findings:
+                # Keep higher scoring finding
+                if f.get("score", 0) > unique_findings[key].get("score", 0):
+                    unique_findings[key] = f
+            else:
+                unique_findings[key] = f
+        
+        return list(unique_findings.values())
+    
+    def _calculate_final_score(self, finding: Dict) -> float:
+        """Calculate final score for a finding"""
+        base_score = finding.get("score", 50)
+        
+        # Boost for severity
+        severity = finding.get("severity", "").lower()
+        if "critical" in severity:
+            base_score *= 1.2
+        elif "high" in severity:
+            base_score *= 1.1
+        
+        # Boost for confidence
+        confidence = finding.get("confidence", "").lower()
+        if confidence == "high":
+            base_score *= 1.1
+        elif confidence == "low":
+            base_score *= 0.9
+        
+        return min(100, base_score)
 
     def display(self, results: List[Dict]):
         if not results:
@@ -143,7 +180,11 @@ class PatternMatcher:
             color = "red" if any(x in severity for x in ["crit", "high"]) else "orange3" if "med" in severity else "blue"
             icon = "🔴" if any(x in severity for x in ["crit", "high"]) else "🟠" if "med" in severity else "🟡"
             
-            panel_title = f"{icon} {r['type']} (Confidence: {r.get('confidence', 'N/A')})"
+            # Add validation indicator if available
+            validation_indicator = r.get("validation_indicator", "")
+            title_suffix = f" {validation_indicator}" if validation_indicator else ""
+            
+            panel_title = f"{icon} {r['type']} (Confidence: {r.get('confidence', 'N/A')}){title_suffix}"
             
             content = f"[bold]Location:[/bold] {r['file']}\n"
             content += f"[bold]Detected By:[/bold] {r.get('source', 'Unknown')}\n\n"
@@ -154,6 +195,9 @@ class PatternMatcher:
             
             if r.get("remediation"):
                 content += f"[bold]✅ Remediation:[/bold]\n{r['remediation']}\n\n"
+            
+            if r.get("validation_status"):
+                content += f"[bold]🧪 Validation:[/bold] {r['validation_status'].upper()}\n\n"
                 
             console.print(Panel(content, title=panel_title, border_style=color))
             if r.get("code_snippet"):
