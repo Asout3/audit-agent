@@ -12,6 +12,9 @@ Unlike traditional static analysis or simple pattern matching, this tool:
 - **Thinks like an auditor**: Extracts *why* developers thought their code was safe, then checks if your code makes the same assumptions
 - **Finds deep bugs**: Focuses on vulnerabilities with <5 duplicates (the ones 30+ auditors missed)
 - **Cross-protocol intelligence**: Recognizes that a bug in "Lending 2023" might appear as "Perps 2025"
+- **Multiple analyzers**: Combines Slither, static analysis, call graph analysis, and semantic matching
+- **Faster with Groq**: Uses Groq's optimized inference for 3-5x speed improvement over OpenRouter
+- **More patterns**: Detects timestamp manipulation, storage collisions, ERC20 approval issues, proxy bugs, weak randomness, and access control issues
 - **Resumes automatically**: If your internet dies at finding 180/200, it resumes there (not from 0)
 
 ---
@@ -21,8 +24,8 @@ Unlike traditional static analysis or simple pattern matching, this tool:
 - Python 3.9+
 - 2GB free disk space (for AI models)
 - API keys for:
-  - **Solodit** (access to 50k audit findings)
-  - **OpenRouter** (free LLM access - no OpenAI account needed)
+  - **Solodit** (optional - for building pattern database)
+  - **Groq** (required - faster LLM inference with generous free tier)
 
 ---
 
@@ -36,24 +39,27 @@ cd deep-audit-agent
 # Create virtual environment (Arch Linux users: mandatory)
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-2. Install Dependencies
-bash
-Copy
-pip install requests python-dotenv sentence-transformers torch numpy tqdm rich
-Note: First install takes ~5 minutes. Downloads PyTorch (CPU) and ML models.
-3. Configure Environment
-Create .env file:
-bash
-Copy
-# Required: Solodit API (get from solodit.cyfrin.io)
+
+# 2. Install Dependencies
+pip install -r requirements.txt
+
+# Note: First install takes ~5 minutes. Downloads PyTorch (CPU), Groq SDK, and ML models.
+
+# 3. Configure Environment
+# Copy .env.example to .env
+cp .env.example .env
+
+# Edit .env and add your API keys:
+# Required: Groq API (get from console.groq.com - generous free tier)
+GROQ_API_KEY=gsk_your_key_here
+
+# Optional: Solodit API (for building pattern database)
 SOLODIT_API_KEY=sk_your_key_here
 
-# Required: OpenRouter (get from openrouter.ai - free tier)
-OPENROUTER_API_KEY=sk-or-v1-your_key_here
-
 # Optional: Model selection (default is good)
-OR_MODEL=upstage/solar-pro
-# Alternative: OR_MODEL=arcee-ai/trinity-large-preview
+# Options: llama-3.3-70b-versatile, llama-3.1-70b-versatile, mixtral-8x7b-32768
+GROQ_MODEL=llama-3.3-70b-versatile
+```
 🚀 Usage
 Step 1: Build the Knowledge Base
 Fetch and analyze historical vulnerabilities (one-time setup per focus area):
@@ -68,20 +74,24 @@ python main.py --build --focus Perpetual --count 300
 # Or general (no focus)
 python main.py --build --count 500
 What happens:
-Fetches findings from Solodit API (respects 20/min rate limit)
-LLM extracts "assumed invariants" from each bug report
-Stores semantic embeddings in local SQLite database
-Resumes automatically if interrupted (check audit_data/checkpoint.json)
-Time: ~15 minutes for 200 findings (mostly waiting for API rate limits)
+- Fetches findings from Solodit API (respects rate limit)
+- LLM (via Groq) extracts "assumed invariants" from each bug report
+- Stores semantic embeddings in local SQLite database
+- Resumes automatically if interrupted (check audit_data/checkpoint.json)
+- Time: ~10-15 minutes for 200 findings (faster with Groq!)
 Step 2: Audit Your Target
 Analyze a codebase:
 bash
 Copy
 python main.py --audit ./path/to/protocol-contracts
 Output:
-CRITICAL HYPOTHESIS: High-confidence architectural bugs
-Potential Issue: Medium-confidence patterns
-Pattern Match: Direct similarity to historical bugs
+- **SLITHER**: Standard Slither detector findings
+- **STATIC**: Static analysis patterns (unchecked calls, delegatecall, oracle issues, etc.)
+- **CROSS-FUNCTION REENTRANCY**: Multi-function reentrancy patterns
+- **DELEGATECALL INJECTION**: Delegatecall to controllable targets
+- **FLASH LOAN VECTOR**: Flash loan callback risks
+- **INVARIANT**: Semantic pattern matches with historical bugs
+
 JSON report saved to audit_report.json
 🧠 How It Works
 The Invariant Extraction Pipeline
@@ -107,11 +117,11 @@ LLM generates hypotheses: "Your borrow() assumes price doesn't change during exe
 Why This Finds Deep Bugs
 Table
 Copy
-Traditional Tool	Deep Audit Agent
-grep reentrancy	"Finds where assumed atomicity breaks"
-Code similarity	Semantic invariant matching
-Surface patterns (30+ duplicates)	<5 duplicates (sophisticated bugs)
-Single protocol focus	Cross-protocol pattern migration
+Traditional Tool    Deep Audit Agent
+grep reentrancy    "Finds where assumed atomicity breaks"
+Code similarity    Semantic invariant matching
+Surface patterns (30+ duplicates)    <5 duplicates (sophisticated bugs)
+Single protocol focus    Cross-protocol pattern migration
 📊 Understanding Output
 Example Output
 Text
@@ -142,11 +152,11 @@ ERC20 / ERC721 (Token standards)
 Leave empty for general
 Tuning Parameters
 Edit config.py:
-Python
-Copy
+```python
 MAX_DUPLICATES = 3      # Lower = more unique bugs (increase to 10 for more results)
 BATCH_SIZE = 50         # API pagination (don't change)
- OR_MODEL = "..."       # See OpenRouter for alternatives
+GROQ_MODEL = "..."      # See Groq console for alternatives
+```
 🔧 Troubleshooting
 "ModuleNotFoundError: No module named 'dotenv'"
 bash
@@ -160,11 +170,11 @@ export TMPDIR=$HOME/tmp
 mkdir -p $HOME/tmp
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 "Rate limit exceeded" from Solodit
-Normal. Tool auto-handles this with 3.1s delays between requests. Just wait.
-OpenRouter returns 429 (rate limit)
+Normal. Tool auto-handles this with delays between requests. Just wait.
+Groq returns 429 (rate limit)
 Tool auto-retries with exponential backoff. If persistent:
 Wait 1 minute, retry
-Or switch model in .env: OR_MODEL=arcee-ai/trinity-large-preview
+Or switch model in .env: GROQ_MODEL=mixtral-8x7b-32768
 "No patterns found" during audit
 Check if DB built: ls audit_data/findings.db (should be >1MB)
 Try broader focus: --focus Lending instead of specific sub-category
@@ -210,24 +220,28 @@ python main.py --audit ./contest-code
 # Write PoCs for each
 # Submit highest confidence + most novel
 📁 File Structure
-Copy
+```
 deep-audit-agent/
 ├── .env                    # API keys (gitignore this)
+├── .env.example            # Environment template
 ├── audit_data/
-│   ├── findings.db         # SQLite database
+│   ├── patterns.db         # SQLite database
 │   └── checkpoint.json     # Resume state
 ├── config.py               # Configuration
 ├── solodit_fetcher.py      # API client with caching
-├── llm_client.py           # OpenRouter integration
+├── llm_client.py           # Groq integration
 ├── local_db.py            # Vector database
-├── target_parser.py       # Solidity AST parser
+├── target_analyzer.py     # Slither-based analysis
+├── static_analyzer.py     # Static analysis patterns
+├── call_graph.py          # Cross-function bug detection
 ├── pattern_matcher.py     # Core hunting logic
 └── main.py                # CLI entry point
+```
 ⚠️ Limitations
-Requires Internet: For LLM calls (OpenRouter) and initial DB build (Solodit)
-Solidity Only: Currently parses .sol files only
-LLM Dependent: Quality depends on OpenRouter model availability (free tier)
-Not a Silver Bullet: Finds candidates you must verify. ~30% false positive rate (normal for AI-assisted auditing)
+- Requires Internet: For LLM calls (Groq) and initial DB build (Solodit)
+- Solidity Only: Currently parses .sol files only
+- LLM Dependent: Quality depends on Groq model availability
+- Not a Silver Bullet: Finds candidates you must verify. ~30% false positive rate (normal for AI-assisted auditing)
 🤝 Contributing
 To add support for other languages (Rust, Vyper):
 Modify target_parser.py regex patterns
@@ -237,12 +251,12 @@ Edit prompts in llm_client.py
 Add more sophisticated AST parsing using slither or crytic-compile
 📜 License
 MIT - Use at your own risk for security research and bug bounties.
-Warning: This tool accesses external APIs (Solodit, OpenRouter). Do not use for illegal purposes. Only audit contracts you have permission to test (contests, bug bounties, your own code).
+Warning: This tool accesses external APIs (Solodit, Groq). Do not use for illegal purposes. Only audit contracts you have permission to test (contests, bug bounties, your own code).
 🆘 Support
 Issues:
-Check audit_data/checkpoint.json if fetch crashes
-Verify API keys with python -c "from config import Config; print(Config.SOLODIT_API_KEY[:10])"
-Test OpenRouter: curl https://openrouter.ai/api/v1/models -H "Authorization: Bearer $KEY"
+- Check audit_data/checkpoint.json if fetch crashes
+- Verify API keys with: `python -c "from config import Config; print(Config.GROQ_API_KEY[:10])"`
+- Test Groq: Visit console.groq.com to verify your API key is active
 
 
 
@@ -263,40 +277,67 @@ python main.py --build --focus Lending --count 10
 # If that works, build full database (200-300 findings, takes ~15 mins)
 python main.py --build --focus Lending --count 200
 What you should see:
-Copy
+```
 [API Health Check]
 [✓] Solodit API connected
-[✓] OpenRouter connected (upstage/solar-pro)
-[+] Fetching findings (rate limit: 20/min)...
-  Progress: 10/200 (offset 50)
+[✓] Groq connected (llama-3.3-70b-versatile)
+[+] Fetching findings (respects rate limit)...
+  Progress: 10/200
   ...
 [✓] Database built: 200 patterns
+```
 Step 3: Audit a Target
 bash
 Copy
 # Point to any folder with .sol files
 python main.py --audit ./path/to/some/protocol-contracts
 Expected output:
-Copy
+```
 [Deep Bug Hunt]
 [+] Scanning 15 Solidity files...
 [✓] Parsed 15 files
-[+] Indexing patterns...
+[+] Running Slither detectors...
+[+] Running static analysis...
+[+] Running call graph analysis...
+[+] Deep analysis on 60 high-risk functions...
 [+] Database: 200 patterns loaded
 
-(1/15) Analyzing src/LendingPool.sol...
-(2/15) Analyzing src/Oracle.sol...
+Found 15 potential issues:
 
-Found 8 potential issues:
+[SLITHER reentrancy-eth]
+Description: Reentrancy in withdraw()...
+File: src/LendingPool.sol
+Score: 80
 
-[CRITICAL HYPOTHESIS]
+[STATIC UNCHECKED_LOW_LEVEL_CALL]
+Description: Low-level call without success check
+File: src/Oracle.sol::getPrice
+Score: 85
+
+[CROSS-FUNCTION REENTRANCY]
+Description: checkBalance() reads state that updateBalance() modifies after external call
+File: checkBalance
+Attack path: checkBalance → updateBalance → external_call → state_change
+Score: 90
+
+[INVARIANT]
 Description: Flash loan can manipulate collateral price...
-Location: borrow()
-Attack: Attacker sandwiches oracle update...
+File: src/LendingPool.sol::borrow
+Attack: Attacker sandwiches oracle update with large swap
+Score: 75
 
-[Pattern Match]
-Description: Similar to bug: Price oracle staleness...
-Similarity: 0.87
+Severity Summary:
+Level    Count
+High     8
+Medium   5
+Low      2
+
+Analyzer Breakdown:
+SLITHER: 3
+STATIC: 5
+CROSS-FUNCTION REENTRANCY: 2
+INVARIANT: 5
+```
 Quick Test (if you don't have a target yet)
 bash
 Copy

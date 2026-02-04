@@ -8,10 +8,11 @@ class Config:
     SOLODIT_BASE_URL = "https://solodit.cyfrin.io/api/v1/solodit"
     SOLODIT_RATE_LIMIT_DELAY = 4.0
 
-    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-    OR_MODEL = os.getenv("OR_MODEL", "arcee-ai/trinity-large-preview:free")
-    OR_TEMPERATURE = 0.02
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    GROQ_TEMPERATURE = 0.02
+    GROQ_MAX_RETRIES = 3
+    GROQ_TIMEOUT = 60
 
     DATA_DIR = Path("audit_data")
     DB_PATH = DATA_DIR / "patterns.db"
@@ -25,3 +26,7 @@ class Config:
     RISK_DELEGATECALL = 45
     RISK_REENTRANCY = 40
     RISK_ASSEMBLY = 25
+    RISK_TIMESTAMP = 15
+    RISK_STORAGE_COLLISION = 30
+    RISK_APPROVAL_DOUBLE_SPEND = 50
+    RISK_WEAK_RANDOMNESS = 35

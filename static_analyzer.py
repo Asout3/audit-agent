@@ -31,7 +31,6 @@ class StaticAnalyzer:
             end = min(len(code), match.end() + 200)
             context = code[start:end]
             
-            # Check if checked
             if not any(x in context for x in ['require(', 'if(', 'success', 'return']):
                 findings.append({
                     "type": "unchecked_low_level_call",
@@ -44,11 +43,9 @@ class StaticAnalyzer:
         
         # 2. Delegatecall injection (check if user-controlled)
         if 'delegatecall' in code_lower:
-            # Check if target is controllable
             delegate_matches = re.finditer(r'(\w+)\.delegatecall\s*\(', code, re.IGNORECASE)
             for match in delegate_matches:
                 target = match.group(1)
-                # If target is msg.data, storage slot, or parameter = dangerous
                 context_before = code[max(0, match.start()-500):match.start()]
                 
                 if any(x in context_before for x in ['calldata', 'msg.data', 'storage', 'sload']):
@@ -94,13 +91,11 @@ class StaticAnalyzer:
         # 5. Reentrancy without guard
         ext_calls = re.finditer(r'(\w+\.(call|transfer|send|mint|burn)\s*[\(\{])', code, re.IGNORECASE)
         for match in ext_calls:
-            # Check surrounding code
             start = max(0, match.start() - 300)
             end = min(len(code), match.end() + 300)
             context = code[start:end]
             
             if 'nonReentrant' not in context and 'reentrancy' not in context.lower():
-                # Check if state changes after
                 rest_of_function = code[match.end():match.end()+500]
                 if re.search(r'\b(\w+)\s*=|\w+\+\+|--\w+', rest_of_function):
                     findings.append({
@@ -110,7 +105,7 @@ class StaticAnalyzer:
                         "score": 80,
                         "confidence": "medium"
                     })
-                    break  # One finding per function is enough
+                    break
         
         # 6. TX.origin usage
         if 'tx.origin' in code_lower:
@@ -135,7 +130,6 @@ class StaticAnalyzer:
         
         # 8. Unchecked math (Solidity <0.8 or unchecked blocks)
         if 'unchecked' in code_lower:
-            # Find unchecked blocks
             blocks = re.finditer(r'unchecked\s*\{', code, re.IGNORECASE)
             for block in blocks:
                 block_end = code.find('}', block.end())
@@ -155,9 +149,8 @@ class StaticAnalyzer:
         hardcoded = re.finditer(r'0x[a-fA-F0-9]{40}', code)
         for match in hardcoded:
             addr = match.group(0).lower()
-            if addr not in ['0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',  # ETH placeholder
-                           '0x0000000000000000000000000000000000000000']:  # Zero address
-                # Check if it's a known protocol (skip known ones)
+            if addr not in ['0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+                           '0x0000000000000000000000000000000000000000']:
                 if not any(x in code for x in ['constant', 'immutable']):
                     findings.append({
                         "type": "hardcoded_address",
@@ -166,7 +159,7 @@ class StaticAnalyzer:
                         "score": 40,
                         "confidence": "low"
                     })
-                break  # One is enough
+                break
         
         # 10. Timestamp dependence
         if 'block.timestamp' in code_lower or 'now' in code_lower:
@@ -178,5 +171,142 @@ class StaticAnalyzer:
                     "score": 45,
                     "confidence": "low"
                 })
+        
+        # NEW PATTERNS
+        
+        # 11. Timestamp manipulation
+        timestamp_patterns = [
+            (r'block\.timestamp\s*[<>]=?\s*\d+', "Timestamp used in inequality - miners can manipulate"),
+            (r'block\.timestamp\s*%\s*\d+', "Timestamp used in modulo - predictable pattern"),
+            (r'now\s*[<>]=?\s*\d+', "Legacy 'now' keyword - timestamp manipulation risk"),
+        ]
+        for pattern, desc in timestamp_patterns:
+            if re.search(pattern, code):
+                findings.append({
+                    "type": "timestamp_manipulation",
+                    "severity": "medium",
+                    "description": desc,
+                    "score": 50,
+                    "confidence": "medium"
+                })
+                break
+        
+        # 12. Storage collision (proxy pattern)
+        storage_patterns = [
+            r'(uint|bool|address)\s+public\s+\w+\s*=\s*\d+;',
+            r'mapping\s*\([^)]+\)\s+public\s+\w+\s*=',
+        ]
+        for pattern in storage_patterns:
+            if re.search(pattern, code):
+                # Check if in upgradeable context
+                if any(x in code_lower for x in ['proxy', 'implementation', 'upgradeable', 'eip1822']):
+                    findings.append({
+                        "type": "storage_collision",
+                        "severity": "critical",
+                        "description": "Storage slot collision risk in upgradeable contract",
+                        "score": 85,
+                        "confidence": "high"
+                    })
+                    break
+        
+        # 13. ERC20 approval double-spend (approve before setting to 0)
+        if 'approve(' in code:
+            approve_context = re.search(r'function\s+approve\s*\([^)]*\)[^{]*\{([^}]{0,500})', code, re.DOTALL)
+            if approve_context:
+                impl = approve_context.group(1)
+                if 'require(' not in impl and 'if' not in impl.lower():
+                    findings.append({
+                        "type": "erc20_approval_double_spend",
+                        "severity": "high",
+                        "description": "approve() without checking current value - front-running risk",
+                        "score": 75,
+                        "confidence": "medium"
+                    })
+        
+        # 14. Uninitialized proxy
+        if re.search(r'fallback\s*\(\s*\)', code, re.IGNORECASE):
+            # Check if delegatecall is used without implementation check
+            fallback_impl = re.search(r'fallback\s*\(\s*\)[^{]*\{([^}]{0,300})', code, re.DOTALL)
+            if fallback_impl and 'delegatecall' in fallback_impl.group(1).lower():
+                if 'implementation' not in code_lower or 'address(0)' not in code_lower:
+                    findings.append({
+                        "type": "uninitialized_proxy",
+                        "severity": "critical",
+                        "description": "Proxy fallback without implementation zero-address check",
+                        "score": 90,
+                        "confidence": "high"
+                    })
+        
+        # 15. Weak randomness (using block data)
+        weak_random_patterns = [
+            r'block\.timestamp\s*[+*/%-]',
+            r'blockhash\s*\(',
+            r'block\.difficulty',
+        ]
+        for pattern in weak_random_patterns:
+            if re.search(pattern, code):
+                findings.append({
+                    "type": "weak_randomness",
+                    "severity": "high",
+                    "description": "Block data used for randomness - predictable by miners",
+                    "score": 70,
+                    "confidence": "high"
+                })
+                break
+        
+        # 16. Improper access control
+        access_issues = []
+        
+        # Check for functions that modify state without access control
+        state_modify_patterns = [
+            r'function\s+\w+\([^)]*\)\s*public\s*\{',
+            r'function\s+\w+\([^)]*\)\s*external\s*\{',
+        ]
+        
+        for pattern in state_modify_patterns:
+            matches = re.finditer(pattern, code, re.IGNORECASE)
+            for match in matches:
+                func_start = match.start()
+                func_end = code.find('}', func_start + 200)
+                func_body = code[func_start:func_end]
+                
+                # Check if function modifies state
+                if any(x in func_body for x in ['=', 'transfer(', 'mint(', 'burn(', 'approve(']):
+                    # Check if access control is present
+                    has_access_control = any(
+                        x in func_body.lower() for x in [
+                            'onlyowner', 'onlyadmin', 'require(msg.sender',
+                            'hasrole', 'isowner', 'auth'
+                        ]
+                    )
+                    
+                    if not has_access_control:
+                        access_issues.append({
+                            "type": "missing_access_control",
+                            "severity": "high",
+                            "description": "Public/external function modifies state without access control",
+                            "score": 80,
+                            "confidence": "medium"
+                        })
+        
+        findings.extend(access_issues[:3])  # Limit to 3 access control findings
+        
+        # 17. Proxy selector clash
+        if 'fallback()' in code or 'receive()' in code:
+            # Check for multiple functions with same selector collision risk
+            func_names = re.findall(r'function\s+(\w+)\s*\([^)]*\)', code)
+            func_sigs = {}
+            for func in func_names:
+                sig = func[:4]  # Simplified selector check
+                if sig in func_sigs:
+                    findings.append({
+                        "type": "function_selector_clash",
+                        "severity": "medium",
+                        "description": f"Potential selector clash: {func_sigs[sig]} and {func}",
+                        "score": 55,
+                        "confidence": "low"
+                    })
+                    break
+                func_sigs[sig] = func
         
         return findings

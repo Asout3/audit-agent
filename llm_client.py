@@ -1,8 +1,8 @@
 import json
 import time
-import requests
 from dataclasses import dataclass
 from typing import List, Dict
+from groq import Groq
 from config import Config
 
 @dataclass
@@ -16,70 +16,68 @@ class ExtractionResult:
 
 class LLMClient:
     def __init__(self):
-        self.api_key = Config.OPENROUTER_API_KEY
-        self.model = Config.OR_MODEL
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "https://localhost",
-            "X-Title": "DeepAudit",
-            "Content-Type": "application/json"
-        }
+        self.api_key = Config.GROQ_API_KEY
+        if not self.api_key:
+            raise ValueError("GROQ_API_KEY not set in environment")
+        self.model = Config.GROQ_MODEL
+        self.client = Groq(api_key=self.api_key)
         
     def validate(self) -> bool:
-        """Test OpenRouter connection"""
+        """Test Groq connection"""
         try:
-            resp = requests.post(
-                f"{Config.OPENROUTER_BASE_URL}/chat/completions",
-                headers=self.headers,
-                json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": "Say hi"}],
-                    "max_tokens": 5
-                },
-                timeout=10
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": "Say hi"}],
+                max_tokens=5
             )
-            if resp.status_code == 200:
-                print(f"[✓] OpenRouter connected ({self.model})")
+            if response.choices[0].message.content:
+                print(f"[✓] Groq connected ({self.model})")
                 return True
-            print(f"[✗] OpenRouter error {resp.status_code}")
+            print(f"[✗] Groq returned empty response")
             return False
         except Exception as e:
-            print(f"[✗] Cannot reach OpenRouter: {e}")
+            print(f"[✗] Cannot reach Groq: {e}")
             return False
     
-    def _call_with_retry(self, payload: dict, max_retries: int = 3) -> dict:
+    def _call_with_retry(self, messages: List[Dict], max_retries: int = None, **kwargs) -> Dict:
         """Make API call with exponential backoff"""
+        if max_retries is None:
+            max_retries = Config.GROQ_MAX_RETRIES
+            
         for i in range(max_retries):
             try:
-                resp = requests.post(
-                    f"{Config.OPENROUTER_BASE_URL}/chat/completions",
-                    headers=self.headers,
-                    json=payload,
-                    timeout=60
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    timeout=Config.GROQ_TIMEOUT,
+                    **kwargs
                 )
-                
-                if resp.status_code == 429:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": response.choices[0].message.content
+                        }
+                    }]
+                }
+            except Exception as e:
+                error_str = str(e).lower()
+                if 'rate' in error_str or 'limit' in error_str:
                     wait = 2 ** (i + 2)
                     print(f"    [!] Rate limited, waiting {wait}s...")
                     time.sleep(wait)
                     continue
-                
-                if resp.status_code != 200:
-                    print(f"    [!] OR error {resp.status_code}, retry {i+1}/{max_retries}")
+                elif i < max_retries - 1:
+                    print(f"    [!] Groq error: {e}, retry {i+1}/{max_retries}")
                     time.sleep(2 ** i)
                     continue
-                
-                return resp.json()
-            except Exception as e:
-                print(f"    [!] Network error: {e}, retry {i+1}")
-                time.sleep(2 ** i)
+                else:
+                    print(f"    [!] Groq error after {max_retries} retries: {e}")
         
         return None
     
     def _strict_parse(self, text: str) -> ExtractionResult:
         """Parse LLM response with multiple fallback strategies"""
         try:
-            # Clean markdown
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0]
             elif "```" in text:
@@ -87,7 +85,6 @@ class LLMClient:
             
             data = json.loads(text.strip())
             
-            # Validate and clean
             def clean_str(s):
                 if not s or not isinstance(s, str):
                     return ""
@@ -105,7 +102,6 @@ class LLMClient:
             if len(break_cond) < 10:
                 raise ValueError("Break condition too short")
             
-            # Normalize arrays
             preconditions = data.get('preconditions', [])
             if not isinstance(preconditions, list):
                 preconditions = [str(preconditions)] if preconditions else []
@@ -156,7 +152,6 @@ class LLMClient:
     def extract_invariant(self, content: str, title: str, max_retries: int = 3) -> ExtractionResult:
         """Extract invariant with aggressive retry and repair"""
         
-        # First try: strict JSON
         base_prompt = f"""Analyze this smart contract vulnerability and extract the invariant violation that the developer assumed was true.
 
 Title: {title}
@@ -187,13 +182,12 @@ Rules:
 
         for attempt in range(max_retries):
             try:
-                result = self._call_with_retry({
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": base_prompt}],
-                    "temperature": Config.OR_TEMPERATURE,
-                    "max_tokens": 800,
-                    "response_format": {"type": "json_object"}
-                })
+                result = self._call_with_retry(
+                    [{"role": "user", "content": base_prompt}],
+                    temperature=Config.GROQ_TEMPERATURE,
+                    max_tokens=800,
+                    response_format={"type": "json_object"}
+                )
                 
                 if result:
                     text = result["choices"][0]["message"]["content"]
@@ -204,17 +198,14 @@ Rules:
                     break
                 time.sleep(2 ** attempt)
         
-        # Fallback: try with simpler prompt
         return self._emergency_extraction(content, title)
     
     def _emergency_extraction(self, content: str, title: str) -> ExtractionResult:
         """Last resort extraction using simple heuristics"""
         content_lower = (content + title).lower()
         
-        # Infer from keywords
         vuln_type = self._infer_vuln_class(content_lower)
         
-        # Extract first substantial sentence as invariant
         sentences = content.replace('\n', ' ').split('. ')
         first_real = title
         for s in sentences:
@@ -236,7 +227,6 @@ Rules:
         if not patterns:
             return []
             
-        # Take top 2 patterns for context
         top_patterns = patterns[:2]
         context = "\n\n".join([
             f"Historical Bug {i+1}:\nInvariant: {p.get('invariant', 'Unknown')}\nBroken by: {p.get('break_condition', 'Unknown')[:200]}"
@@ -266,13 +256,13 @@ Does this function make similar dangerous assumptions? Return JSON array with up
 If no match, return empty array []."""
 
         try:
-            result = self._call_with_retry({
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 600,
-                "response_format": {"type": "json_object"}
-            }, max_retries=2)
+            result = self._call_with_retry(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=600,
+                response_format={"type": "json_object"},
+                max_retries=2
+            )
             
             if result:
                 text = result["choices"][0]["message"]["content"]
@@ -290,7 +280,6 @@ If no match, return empty array []."""
         for i in range(0, len(findings), batch_size):
             batch = findings[i:i+batch_size]
             
-            # Single LLM call for batch
             batch_text = "\n\n---\n\n".join([
                 f"FINDING {j}:\nTitle: {f.get('title', '')}\nContent: {f.get('content', '')[:1500]}"
                 for j, f in enumerate(batch)
@@ -314,13 +303,13 @@ Return exactly this format:
 ]"""
 
             try:
-                result = self._call_with_retry({
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens": 1200,
-                    "response_format": {"type": "json_object"}
-                }, max_retries=2)
+                result = self._call_with_retry(
+                    [{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    max_tokens=1200,
+                    response_format={"type": "json_object"},
+                    max_retries=2
+                )
                 
                 if result:
                     text = result["choices"][0]["message"]["content"]
@@ -343,7 +332,6 @@ Return exactly this format:
                                     )
                                 })
                             except:
-                                # Fallback to individual extraction
                                 results.append({
                                     "finding": batch[idx],
                                     "extraction": self._emergency_extraction(
@@ -355,7 +343,6 @@ Return exactly this format:
             except Exception as e:
                 print(f"  [!] Batch extraction failed: {e}")
             
-            # Fallback: individual extraction
             for f in batch:
                 results.append({
                     "finding": f,
